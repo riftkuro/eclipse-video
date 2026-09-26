@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+runtime/
+build/
+dist/
+*.spec
+settings.json
+startup-error.log
+*.log
+*.tmp
+.player-*.lock
