@@ -1,0 +1,61 @@
+name: Windows build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      attach:
+        description: Attach the installer to the release for this version
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller==6.11.1
+
+      - name: Version
+        id: version
+        shell: bash
+        run: echo "value=$(python -c "import re;print(re.search(r\"VERSION = '([^']+)'\", open('app.py').read())[1])")" >> "$GITHUB_OUTPUT"
+
+      - name: Bundle
+        run: |
+          pyinstaller --noconfirm --windowed --name "Eclipse Video" --icon assets/eclipse-app.ico --add-data "assets;assets" --add-data "THIRD-PARTY-NOTICES.txt;." app.py
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\Eclipse Video\Eclipse Video.exe" -ArgumentList "--settings","$env:RUNNER_TEMP\settings.json","--port","49999" -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) { throw "Eclipse Video exited early with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id
+
+      - name: Installer
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.version.outputs.value }} installer\eclipse-video.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist-installer/*.exe
+
+      - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'release' || inputs.attach
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          files: dist-installer/*.exe
