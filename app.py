@@ -15,10 +15,22 @@ from bridge import Bridge, PORT
 from sync import finite, palette, target_ms
 from updater import Updater
 
-VERSION = '1.6.0'
+VERSION = '1.7.0'
 
 ROOT = Path(__file__).resolve().parent
-DATA = Path(os.environ.get('LOCALAPPDATA', str(Path.home()/'AppData/Local')))/'Eclipse Video'
+MAC = sys.platform == 'darwin'
+WINDOWS = sys.platform == 'win32'
+
+
+def data_dir():
+    if WINDOWS:
+        return Path(os.environ.get('LOCALAPPDATA', str(Path.home()/'AppData/Local')))/'Eclipse Video'
+    if MAC:
+        return Path.home()/'Library/Application Support/Eclipse Video'
+    return Path(os.environ.get('XDG_DATA_HOME', str(Path.home()/'.local/share')))/'Eclipse Video'
+
+
+DATA = data_dir()
 SETTINGS = DATA / 'settings.json'
 UPDATES = DATA / 'updates'
 
@@ -125,7 +137,7 @@ class Player(QMainWindow):
         except (OSError, ValueError):
             self.settings = {}
         self.setWindowTitle('Eclipse Video')
-        self.setWindowIcon(QIcon(str(ROOT/'assets/eclipse-app.ico')))
+        self.setWindowIcon(QIcon(str(ROOT/('assets/eclipse-app.ico' if WINDOWS else 'assets/eclipse-app.png'))))
         self.always_on_top = self.settings.get('alwaysOnTop') is True
         flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
         if self.always_on_top:
@@ -555,7 +567,7 @@ class Player(QMainWindow):
         self.checked_by_hand = False
 
     def pick_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, 'Open video', str(self.media_path.parent if self.media_path else Path.home()/'Videos'), 'Videos (*.mp4 *.mov *.mkv *.webm *.avi *.wmv *.m4v);;All files (*)')
+        path, _ = QFileDialog.getOpenFileName(self, 'Open video', str(self.media_path.parent if self.media_path else Path.home()/('Movies' if MAC else 'Videos')), 'Videos (*.mp4 *.mov *.mkv *.webm *.avi *.wmv *.m4v);;All files (*)')
         if path:
             self.open_video(path)
 
@@ -1086,10 +1098,9 @@ class Player(QMainWindow):
 
 
 def main():
-    if sys.platform != 'win32':
-        raise SystemExit('Eclipse Video is for Windows.')
-    import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('riftkuro.EclipseVideo')
+    if WINDOWS:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('riftkuro.EclipseVideo')
     args = argparse.ArgumentParser()
     args.add_argument('--port', type=int, default=PORT)
     args.add_argument('--settings', type=Path, default=SETTINGS)
