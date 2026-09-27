@@ -32,6 +32,7 @@ class Canvas(QWidget):
         self.setAcceptDrops(True)
         self.open_file = None
         self.hover = False
+        self.error = ''
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -67,6 +68,11 @@ class Canvas(QWidget):
             size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
             x, y = (self.width()-size.width())//2, (self.height()-size.height())//2
             p.drawImage(x, y, self.image.scaled(size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        if self.error:
+            color = QColor('#ffa69b')
+            p.setPen(color)
+            p.setFont(QFont('Roboto Mono', 10))
+            p.drawText(self.rect().adjusted(12, 0, -12, -10), Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter, self.error)
         p.setClipping(False)
         stroke = QColor(self.colors['Strk'][0])
         if self.hover:
@@ -140,7 +146,8 @@ class Player(QMainWindow):
         self.arm_until = 0
         self.frame_ms = 0.0
         self.frame_received = 0.0
-        self.frames = deque(maxlen=12)
+        self.frames = deque(maxlen=48)
+        self.startup_ms = finite(self.settings.get('startupMs'), 40, 0, 150)
         self.displayed_ms = 0.0
         self.last_correction = 0.0
         self.last_target = 0.0
@@ -599,18 +606,28 @@ class Player(QMainWindow):
             return
         self.frame_ms = frame.startTime()/1000 if frame.startTime() >= 0 else self.media.position()
         self.frame_received = time.perf_counter()
+        if self.played_at and not self.first_frame_at:
+            self.first_frame_at = self.frame_received
+            self.learn_startup((self.first_frame_at-self.played_at)*1000)
+            self.metrics.append({'scheduled': self.scheduled_at, 'played': self.played_at, 'firstFrame': self.first_frame_at, 'frameMs': self.frame_ms})
         if self.following() and self.remote.get('playing') and self.media.isPlaying():
             self.frames.append((self.frame_ms, image))
             return
         self.present(self.frame_ms, image)
 
+    def learn_startup(self, measured):
+        # decoder wake-up time is stable per machine; keep a smoothed estimate to pre-roll the next start
+        measured = finite(measured, self.startup_ms, 0, 150)
+        self.startup_ms = round(self.startup_ms*.6 + measured*.4, 1)
+        self.save()
+
+    def frame_period(self):
+        return 1000/float(self.media.metaData().value(QMediaMetaData.Key.VideoFrameRate) or 30)
+
     def present(self, position, image):
         self.displayed_ms = position
         self.canvas.image = image
         self.canvas.update()
-        if self.played_at and not self.first_frame_at:
-            self.first_frame_at = time.perf_counter()
-            self.metrics.append({'scheduled': self.scheduled_at, 'played': self.played_at, 'firstFrame': self.first_frame_at, 'frameMs': self.frame_ms})
 
     def duration_changed(self, duration):
         self.seek.setRange(0, duration)
@@ -837,7 +854,7 @@ class Player(QMainWindow):
     def save(self):
         if not hasattr(self, 'volume'):
             return
-        data = {'alwaysOnTop': self.always_on_top, 'volume': self.volume.value(), 'restoreVolume': self.restore_volume, 'muted': self.mute.isChecked(), 'delay': self.offset.value(), 'speed': self.speed.value(), 'sync': self.sync.isChecked(), 'autoUpdate': self.auto_update.isChecked(), 'theme': self.colors}
+        data = {'alwaysOnTop': self.always_on_top, 'volume': self.volume.value(), 'restoreVolume': self.restore_volume, 'muted': self.mute.isChecked(), 'delay': self.offset.value(), 'speed': self.speed.value(), 'sync': self.sync.isChecked(), 'autoUpdate': self.auto_update.isChecked(), 'startupMs': self.startup_ms, 'theme': self.colors}
         if self.media_path:
             data['file'] = str(self.media_path)
         temporary = self.settings_path.with_suffix('.tmp')
@@ -848,6 +865,12 @@ class Player(QMainWindow):
         return {'alwaysOnTop': self.always_on_top, 'connected': bool(self.owner), 'ready': self.prepared, 'file': self.media_path.name if self.media_path else '', 'positionMs': self.media.position(), 'frameMs': self.frame_ms, 'displayedMs': self.displayed_ms, 'playing': self.media.isPlaying(), 'driftMs': round(self.last_drift, 2), 'scheduledAt': self.scheduled_at, 'playedAt': self.played_at, 'firstFrameAt': self.first_frame_at, 'sync': self.sync.isChecked(), 'delayMs': self.offset.value(), 'speed': self.speed.value(), 'volume': self.volume.value(), 'muted': self.mute.isChecked(), 'control': self.control}
 
     def command(self, request):
+        try:
+            self.handle(request)
+        except Exception as error:
+            request.finish({'error': f'player error: {error}'})
+
+    def handle(self, request):
         data = request.data
         now = time.perf_counter()
         action = data.get('action')
@@ -865,7 +888,8 @@ class Player(QMainWindow):
         self.owner = session
         self.last_message = now
         seq = int(finite(data.get('seq'), 0, 0, 2**53))
-        if seq <= self.seq:
+        # a sequence that jumps far backwards means the plugin restarted its counter
+        if self.seq-10000 < seq <= self.seq:
             return request.finish(self.snapshot())
         self.seq = seq
         if self.control and finite(data.get('ack'), -1, -1, 2**53) >= self.control['id']:
@@ -891,7 +915,10 @@ class Player(QMainWindow):
             self.remote = state
             self.refresh_play_label()
             if action == 'state':
-                self.deadline = state['at'] if state['playing'] and state['at'] > now else None
+                if state['playing'] and state['at'] > now:
+                    self.deadline = state['at']
+                elif not state['playing'] or self.deadline is None or self.deadline <= now:
+                    self.deadline = None
         if action == 'stop':
             self.deadline = None
             self.frames.clear()
@@ -943,6 +970,12 @@ class Player(QMainWindow):
             request.finish(result)
 
     def tick(self):
+        try:
+            self.step_clock()
+        except Exception as error:
+            self.media_error = f'sync error: {error}'
+
+    def step_clock(self):
         now = time.perf_counter()
         linked = self.following()
         interval = 1 if linked and (self.deadline is not None or self.remote.get('playing')) else 16
@@ -958,6 +991,9 @@ class Player(QMainWindow):
             self.save()
         self.set_connected(bool(self.owner))
         self.filename.setToolTip(self.media_error or (str(self.media_path) if self.media_path else 'No video'))
+        if self.canvas.error != self.media_error:
+            self.canvas.error = self.media_error
+            self.canvas.update()
         for control in [self.play, self.previous, self.next, self.seek]:
             control.setEnabled(self.prepared and (not linked or self.remote.get('controllable', True)))
         if self.control and now-self.control_at > 3:
@@ -965,20 +1001,28 @@ class Player(QMainWindow):
         self.refresh_play_label()
         if not linked or not self.prepared or self.arm_request or self.control or self.seek.isSliderDown():
             return
+        period = self.frame_period()
         if self.deadline is not None:
+            # wake the decoder early by its measured start-up time so the first frame lands on the deadline
+            if not self.media.isPlaying() and now >= self.deadline-self.startup_ms/1000:
+                self.media.setPlaybackRate(self.speed.value())
+                self.media.play()
+                self.played_at = now
+                self.last_correction = now
             if now < self.deadline:
                 return
             self.deadline = None
             self.timer.setInterval(8)
-            self.media.setPlaybackRate(self.speed.value())
-            self.media.play()
-            self.played_at = now
-            self.last_correction = now
+            if not self.media.isPlaying():
+                self.media.setPlaybackRate(self.speed.value())
+                self.media.play()
+                self.played_at = now
+                self.last_correction = now
         state = self.remote
         target = target_ms(state, now, self.speed.value(), -self.offset.value())
         target = min(self.media.duration(), max(0, target))
         chosen = None
-        while self.frames and self.frames[0][0] <= target+.5:
+        while self.frames and self.frames[0][0] <= target+period*.5:
             chosen = self.frames.popleft()
         if chosen:
             self.present(*chosen)
@@ -1001,15 +1045,17 @@ class Player(QMainWindow):
             self.last_target = target
             return
         actual = self.frame_ms + max(0, now-self.frame_received)*1000*self.media.playbackRate() if fresh else self.media.position()
-        self.last_drift = target-actual
-        threshold = max(100, 2000/state['fps'])
+        # keep the decoder about a frame ahead so the frame for each tick is already buffered
+        lead = min(20, period)
+        self.last_drift = target+lead-actual
+        threshold = max(90, 2000/state['fps'])
         wrapped = target < self.last_target-50
         if (wrapped or abs(self.last_drift)>threshold) and now-self.last_correction>.5:
             self.frames.clear()
             self.media.setPosition(round(target))
             self.last_correction = now
-        elif now-self.last_correction>.3:
-            rate = self.speed.value()*(1+max(-.025,min(.025,self.last_drift/2000)))
+        elif now-self.last_correction>.2:
+            rate = self.speed.value()*(1+max(-.06,min(.06,self.last_drift/500)))
             if abs(rate-self.media.playbackRate())>.002:
                 self.media.setPlaybackRate(rate)
         self.last_target = target
