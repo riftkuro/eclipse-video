@@ -134,6 +134,7 @@ class Player(QMainWindow):
         self.resize(820, 503)
         self.setMinimumSize(760, 323)
         self.owner = None
+        self.owner_active = False
         self.last_message = 0.0
         self.seq = -1
         self.remote = None
@@ -879,13 +880,18 @@ class Player(QMainWindow):
         session = data.get('session')
         if not isinstance(session, str) or not 1 <= len(session) <= 100:
             return request.finish({'error': 'invalid session'})
-        if self.owner and self.owner != session and now-self.last_message < 3:
+        # a plugin whose editor is open takes over from one that is only idling in another Studio window
+        active = action in {'state', 'arm', 'start', 'stop'} and bool(data.get('controllable', True))
+        if self.owner and self.owner != session and now-self.last_message < 3 and (self.owner_active or not active):
             return request.finish({'error': 'another Eclipse session is connected'})
         if self.owner != session:
             self.seq = -1
             self.remote = None
             self.control = None
+            self.deadline = None
+            self.media.pause()
         self.owner = session
+        self.owner_active = active
         self.last_message = now
         seq = int(finite(data.get('seq'), 0, 0, 2**53))
         # a sequence that jumps far backwards means the plugin restarted its counter
