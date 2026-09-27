@@ -7,16 +7,20 @@ from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QLockFile, QRectF
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QImage, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink, QMediaMetaData
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSizeGrip, QSlider, QToolButton, QVBoxLayout, QWidget
 
 from bridge import Bridge, PORT
 from sync import finite, palette, target_ms
+from updater import Updater
+
+VERSION = '1.6.0'
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('LOCALAPPDATA', str(Path.home()/'AppData/Local')))/'Eclipse Video'
 SETTINGS = DATA / 'settings.json'
+UPDATES = DATA / 'updates'
 
 
 class Canvas(QWidget):
@@ -27,25 +31,29 @@ class Canvas(QWidget):
         self.setMinimumSize(320, 180)
         self.setAcceptDrops(True)
         self.open_file = None
+        self.hover = False
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 6, 6)
+        p.setClipPath(clip)
         colors = self.colors['Bg']
-        gradient = QLinearGradient(0, 0, 0, self.height())
-        gradient.setColorAt(0, QColor(colors[0]))
-        gradient.setColorAt(1, QColor(colors[-1]))
-        p.fillRect(self.rect(), gradient)
-        if not self.image.isNull():
-            size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
-            x, y = (self.width()-size.width())//2, (self.height()-size.height())//2
-            p.drawImage(x, y, self.image.scaled(size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        else:
+        if self.image.isNull():
+            gradient = QLinearGradient(0, 0, 0, self.height())
+            gradient.setColorAt(0, QColor(colors[0]))
+            gradient.setColorAt(1, QColor(colors[-1]))
+            p.fillRect(self.rect(), gradient)
             color = QColor(self.colors['Txt'][0])
-            color.setAlpha(160)
+            color.setAlpha(210 if self.hover else 150)
             p.setPen(color)
             p.setFont(QFont('Roboto Mono', 12))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, 'Drop a video here')
+            p.drawText(self.rect().adjusted(0, -12, 0, -12), Qt.AlignmentFlag.AlignCenter, 'Drop a video here')
+            color.setAlpha(110)
+            p.setPen(color)
+            p.setFont(QFont('Roboto Mono', 10))
+            p.drawText(self.rect().adjusted(0, 14, 0, 14), Qt.AlignmentFlag.AlignCenter, 'or use OPEN VIDEO  ·  mp4, mov, mkv, webm')
             p.setPen(Qt.PenStyle.NoPen)
             for row in range(10):
                 for col in range(13):
@@ -54,12 +62,32 @@ class Canvas(QWidget):
                     p.setBrush(color)
                     r = 1+1.7*strength
                     p.drawEllipse(QRectF(self.width()-20-col*11-(row%2)*5, self.height()-20-row*10, r*2, r*2))
+        else:
+            p.fillRect(self.rect(), QColor(colors[-1]).darker(260))
+            size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+            x, y = (self.width()-size.width())//2, (self.height()-size.height())//2
+            p.drawImage(x, y, self.image.scaled(size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        p.setClipping(False)
+        stroke = QColor(self.colors['Strk'][0])
+        if self.hover:
+            stroke = QColor(self.colors['MenuSel'][0])
+        p.setPen(QPen(stroke, 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 6, 6)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() and any(url.isLocalFile() for url in event.mimeData().urls()):
+            self.hover = True
+            self.update()
             event.acceptProposedAction()
 
+    def dragLeaveEvent(self, event):
+        self.hover = False
+        self.update()
+
     def dropEvent(self, event):
+        self.hover = False
+        self.update()
         for url in event.mimeData().urls():
             if url.isLocalFile() and self.open_file:
                 self.open_file(url.toLocalFile())
@@ -137,11 +165,20 @@ class Player(QMainWindow):
         self.media.positionChanged.connect(self.position_changed)
         self.media.playbackStateChanged.connect(self.playback_changed)
         self.media.mediaStatusChanged.connect(self.media_status)
+        self.installing = False
+        self.checked_by_hand = False
+        self.updater = Updater(VERSION, UPDATES, self)
+        self.updater.found.connect(self.update_found)
+        self.updater.current.connect(self.update_current)
+        self.updater.progress.connect(self.update_progress)
+        self.updater.ready.connect(self.update_ready)
+        self.updater.failed.connect(self.update_failed)
         self.build()
         self.apply_theme(self.colors)
+        self.set_connected(False)
         self.audio.setVolume(self.volume.value()/100)
         self.audio.setMuted(self.mute.isChecked())
-        self.bridge = Bridge(self, port)
+        self.bridge = Bridge(self, port, VERSION)
         self.bridge.received.connect(self.command)
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -155,37 +192,59 @@ class Player(QMainWindow):
         last = self.settings.get('file')
         if last and Path(last).is_file():
             QTimer.singleShot(0, lambda: self.open_video(last))
+        if self.auto_update.isChecked():
+            QTimer.singleShot(2500, self.updater.check)
 
-    def button(self, text, callback, parent=None):
+    def button(self, text, callback, parent=None, kind=None):
         b = QPushButton(text, parent)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
-        b.setMinimumHeight(29)
+        b.setMinimumHeight(28)
         b.clicked.connect(callback)
+        if kind:
+            b.setObjectName(kind)
         return b
+
+    @staticmethod
+    def caption(text):
+        label = QLabel(text)
+        label.setObjectName('Caption')
+        return label
 
     def build(self):
         root = QFrame()
         root.setObjectName('Root')
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(10, 6, 10, 7)
+        layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
         title = Title()
         row = QHBoxLayout(title)
-        row.setContentsMargins(2, 0, 0, 0)
-        self.status = QLabel('ECLIPSE VIDEO - Not Connected')
+        row.setContentsMargins(4, 0, 0, 0)
+        row.setSpacing(6)
+        self.dot = QLabel()
+        self.dot.setObjectName('Dot')
+        self.dot.setFixedSize(8, 8)
+        self.dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row.addWidget(self.dot)
+        self.status = QLabel('ECLIPSE VIDEO')
         self.status.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.status.setObjectName('Title')
         row.addWidget(self.status)
+        self.state = QLabel('Not connected')
+        self.state.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.state.setObjectName('Muted')
+        self.state.setMinimumWidth(QFontMetrics(self.state.font()).horizontalAdvance('Not connected')+4)
+        row.addWidget(self.state)
         row.addStretch()
         self.filename = QLabel('')
         self.filename.setObjectName('Muted')
-        self.filename.setMinimumWidth(0)
-        self.filename.setMaximumWidth(180)
+        self.filename.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         row.addWidget(self.filename)
+        row.addSpacing(6)
         self.open_button = self.button('OPEN VIDEO', self.pick_file)
         row.addWidget(self.open_button)
         self.settings_button = self.button('SETTINGS', self.toggle_settings)
+        self.settings_button.setCheckable(True)
         row.addWidget(self.settings_button)
         self.pin = self.button('PIN', lambda: None)
         self.pin.setCheckable(True)
@@ -194,15 +253,34 @@ class Player(QMainWindow):
         self.pin.setToolTip('Keep Eclipse Video on top of other windows')
         self.pin.toggled.connect(self.set_pinned)
         row.addWidget(self.pin)
-        for text, action in [('−', self.showMinimized), ('□', lambda: self.showNormal() if self.isMaximized() else self.showMaximized()), ('×', self.close)]:
-            b = self.button(text, action)
+        row.addSpacing(6)
+        for text, action, name in [('−', self.showMinimized, 'Window'), ('□', lambda: self.showNormal() if self.isMaximized() else self.showMaximized(), 'Window'), ('×', self.close, 'Close')]:
+            b = self.button(text, action, kind=name)
             b.setFixedWidth(28)
             row.addWidget(b)
         layout.addWidget(title)
+        self.banner = QFrame()
+        self.banner.setObjectName('Banner')
+        banner = QHBoxLayout(self.banner)
+        banner.setContentsMargins(12, 6, 8, 6)
+        banner.setSpacing(8)
+        self.banner_text = QLabel('')
+        banner.addWidget(self.banner_text)
+        banner.addStretch()
+        self.banner_action = self.button('UPDATE', self.update_action, kind='Primary')
+        banner.addWidget(self.banner_action)
+        banner.addWidget(self.button('LATER', lambda: self.banner.hide(), kind='Ghost'))
+        layout.addWidget(self.banner)
+        self.banner.hide()
         self.options = QFrame()
         self.options.setObjectName('Panel')
-        options = QHBoxLayout(self.options)
-        options.setContentsMargins(10, 8, 10, 8)
+        panel = QVBoxLayout(self.options)
+        panel.setContentsMargins(12, 8, 12, 8)
+        panel.setSpacing(6)
+        options = QHBoxLayout()
+        options.setSpacing(8)
+        options.addWidget(self.caption('PLAYBACK'))
+        options.addSpacing(6)
         options.addWidget(QLabel('Delay (ms)'))
         self.offset = QDoubleSpinBox()
         self.offset.setRange(-600000, 600000)
@@ -211,7 +289,7 @@ class Player(QMainWindow):
         self.offset.valueChanged.connect(self.options_changed)
         self.offset.setToolTip('Positive delays the video. Negative advances it.')
         options.addWidget(self.spin_field(self.offset, 62, 'Delay'))
-        options.addSpacing(12)
+        options.addSpacing(10)
         options.addWidget(QLabel('Speed'))
         self.speed = QDoubleSpinBox()
         self.speed.setRange(.25, 4)
@@ -221,7 +299,32 @@ class Player(QMainWindow):
         self.speed.valueChanged.connect(self.options_changed)
         options.addWidget(self.spin_field(self.speed, 52, 'Speed'))
         options.addStretch()
-        options.addWidget(self.button('RESET', lambda: (self.offset.setValue(0), self.speed.setValue(1))))
+        options.addWidget(self.button('RESET', lambda: (self.offset.setValue(0), self.speed.setValue(1)), kind='Ghost'))
+        panel.addLayout(options)
+        divider = QFrame()
+        divider.setObjectName('Divider')
+        divider.setFixedHeight(1)
+        panel.addWidget(divider)
+        updates = QHBoxLayout()
+        updates.setSpacing(8)
+        updates.addWidget(self.caption('UPDATES'))
+        updates.addSpacing(6)
+        version = QLabel(f'Version {VERSION}')
+        version.setObjectName('Muted')
+        updates.addWidget(version)
+        updates.addSpacing(10)
+        self.auto_update = QCheckBox('Auto-update')
+        self.auto_update.setChecked(self.settings.get('autoUpdate', True) is not False)
+        self.auto_update.setToolTip('Download new versions in the background and install them when you close the app')
+        self.auto_update.toggled.connect(self.auto_update_changed)
+        updates.addWidget(self.auto_update)
+        updates.addStretch()
+        self.update_status = QLabel('')
+        self.update_status.setObjectName('Muted')
+        updates.addWidget(self.update_status)
+        self.update_button = self.button('CHECK FOR UPDATES', self.update_action, kind='Ghost')
+        updates.addWidget(self.update_button)
+        panel.addLayout(updates)
         layout.addWidget(self.options)
         self.options.hide()
         self.canvas = Canvas()
@@ -229,42 +332,51 @@ class Player(QMainWindow):
         layout.addWidget(self.canvas, 1)
         self.seek = QSlider(Qt.Orientation.Horizontal)
         self.seek.setRange(0, 0)
+        self.seek.setCursor(Qt.CursorShape.PointingHandCursor)
         self.seek.sliderPressed.connect(self.begin_seek)
         self.seek.sliderMoved.connect(self.update_timestamp)
         self.seek.valueChanged.connect(self.update_timestamp)
         self.seek.sliderReleased.connect(self.finish_seek)
         layout.addWidget(self.seek)
         controls = QHBoxLayout()
-        controls.setSpacing(7)
-        self.previous = self.button('−1', lambda: self.step(-1))
-        self.previous.setFixedWidth(37)
+        controls.setSpacing(6)
+        self.previous = self.button('−1', lambda: self.step(-1), kind='Ghost')
+        self.previous.setFixedWidth(38)
+        self.previous.setToolTip('Previous frame  (Left)')
         controls.addWidget(self.previous)
-        self.play = self.button('PLAY', self.toggle_play)
-        self.play.setFixedWidth(65)
+        self.play = self.button('PLAY', self.toggle_play, kind='Primary')
+        self.play.setFixedWidth(78)
+        self.play.setToolTip('Play / pause  (Space)')
         controls.addWidget(self.play)
-        self.next = self.button('+1', lambda: self.step(1))
-        self.next.setFixedWidth(37)
+        self.next = self.button('+1', lambda: self.step(1), kind='Ghost')
+        self.next.setFixedWidth(38)
+        self.next.setToolTip('Next frame  (Right)')
         controls.addWidget(self.next)
-        self.timestamp = QLabel('00:00.000 / 00:00.000 | Frame 0')
+        controls.addSpacing(6)
+        self.timestamp = QLabel('00:00.000 / 00:00.000 · Frame 0')
         self.timestamp.setObjectName('Muted')
         controls.addWidget(self.timestamp)
         controls.addStretch()
-        self.sync = QCheckBox('Sync')
+        self.sync = QCheckBox('Sync to Eclipse')
         self.sync.setChecked(True)
+        self.sync.setToolTip('Follow the Eclipse timeline while the plugin is connected')
         self.sync.toggled.connect(self.sync_changed)
-        self.mute = self.button('MUTE', lambda: None)
+        self.mute = self.button('MUTE', lambda: None, kind='Ghost')
         self.mute.setCheckable(True)
         self.mute.setChecked(self.settings.get('muted', False))
         self.mute.setText('UNMUTE' if self.mute.isChecked() else 'MUTE')
-        self.mute.setFixedWidth(66)
+        self.mute.setFixedWidth(68)
+        self.mute.setToolTip('Mute  (M)')
         self.mute.toggled.connect(self.set_muted)
         self.volume = QSlider(Qt.Orientation.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setValue(0 if self.mute.isChecked() else int(finite(self.settings.get('volume'), 50, 0, 100)))
-        self.volume.setFixedWidth(72)
+        self.volume.setFixedWidth(90)
+        self.volume.setCursor(Qt.CursorShape.PointingHandCursor)
         self.volume.valueChanged.connect(self.set_volume)
         self.volume.setToolTip('Volume')
         controls.addWidget(self.sync)
+        controls.addSpacing(6)
         controls.addWidget(self.mute)
         controls.addWidget(self.volume)
         grip = QSizeGrip(self)
@@ -298,30 +410,138 @@ class Player(QMainWindow):
         self.colors = palette(raw)
         c = {key: values[0] for key, values in self.colors.items()}
         bg = self.colors['Bg']
+        text = QColor(c['Txt'])
+        muted = text.darker(140).name()
+        faint = text.darker(190).name()
+        hover = QColor(c['TopBtn']).lighter(122).name()
+        ghost = QColor(c['Pnl']).lighter(112).name()
         self.setStyleSheet(f'''
             QWidget {{ font-family: 'Roboto Mono'; font-size: 11px; color: {c['Txt']}; }}
-            QFrame#Root {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {bg[0]},stop:1 {bg[-1]}); border: 1px solid {c['Strk']}; border-radius: 6px; }}
-            QLabel#Title {{ font-size: 12px; font-weight: bold; }}
-            QLabel#Muted {{ color: {QColor(c['Txt']).darker(135).name()}; }}
-            QFrame#Panel {{ background: {c['Pnl']}; border: 1px solid {c['Strk']}; border-radius: 4px; }}
-            QPushButton {{ background: {c['TopBtn']}; border: 1px solid transparent; border-radius: 4px; padding: 3px 9px; }}
-            QPushButton:hover {{ border: 1px solid {c['Strk']}; background: {QColor(c['TopBtn']).lighter(122).name()}; }}
+            QFrame#Root {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {bg[0]},stop:1 {bg[-1]}); border: 1px solid {c['Strk']}; border-radius: 8px; }}
+            QLabel#Title {{ font-size: 12px; font-weight: bold; letter-spacing: 1px; }}
+            QLabel#Muted {{ color: {muted}; }}
+            QLabel#Caption {{ color: {faint}; font-size: 10px; font-weight: bold; letter-spacing: 1px; }}
+            QLabel#Dot {{ background: {faint}; border-radius: 4px; }}
+            QLabel#Dot[connected="true"] {{ background: #5ad48a; }}
+            QFrame#Panel {{ background: {c['Pnl']}; border: 1px solid {c['Strk']}; border-radius: 6px; }}
+            QFrame#Banner {{ background: {c['TopBtn']}; border: 1px solid {c['Strk']}; border-left: 3px solid {QColor(c['MenuSel']).lighter(130).name()}; border-radius: 6px; }}
+            QFrame#Banner QLabel {{ font-weight: bold; }}
+            QFrame#Divider {{ background: {c['Div']}; border: none; }}
+            QPushButton {{ background: {c['TopBtn']}; border: 1px solid transparent; border-radius: 5px; padding: 3px 10px; }}
+            QPushButton:hover {{ border: 1px solid {c['Strk']}; background: {hover}; }}
             QPushButton:checked, QPushButton:pressed {{ background: {c['MenuSel']}; border-color: {c['Strk']}; }}
-            QPushButton:disabled {{ color: {QColor(c['Txt']).darker(190).name()}; }}
-            QFrame#SpinField {{ background: {c['Pnl']}; border: 1px solid {c['Strk']}; border-radius: 4px; }}
+            QPushButton:disabled {{ color: {faint}; background: {c['Pnl']}; }}
+            QPushButton#Primary {{ background: {c['MenuSel']}; font-weight: bold; }}
+            QPushButton#Primary:hover {{ background: {QColor(c['MenuSel']).lighter(118).name()}; border-color: {QColor(c['MenuSel']).lighter(140).name()}; }}
+            QPushButton#Primary:disabled {{ background: {c['Pnl']}; color: {faint}; }}
+            QPushButton#Ghost {{ background: transparent; border: 1px solid {c['Strk']}; }}
+            QPushButton#Ghost:hover {{ background: {ghost}; }}
+            QPushButton#Ghost:checked {{ background: {c['MenuSel']}; }}
+            QPushButton#Window, QPushButton#Close {{ background: transparent; border: none; color: {muted}; font-size: 13px; padding: 0; }}
+            QPushButton#Window:hover {{ background: {ghost}; color: {c['Txt']}; }}
+            QPushButton#Close:hover {{ background: #b8404a; color: white; }}
+            QFrame#SpinField {{ background: {bg[-1]}; border: 1px solid {c['Strk']}; border-radius: 5px; }}
             QDoubleSpinBox {{ background: transparent; border: none; padding: 3px; }}
-            QToolButton {{ background: {c['TopBtn']}; border: none; border-radius: 2px; padding: 0; }}
-            QToolButton:hover {{ background: {QColor(c['TopBtn']).lighter(130).name()}; }}
+            QToolButton {{ background: {c['TopBtn']}; border: none; border-radius: 3px; padding: 0; }}
+            QToolButton:hover {{ background: {hover}; }}
             QToolButton:pressed {{ background: {c['MenuSel']}; }}
-            QSlider::groove:horizontal {{ height: 4px; background: {c['Div']}; border-radius: 2px; }}
+            QSlider::groove:horizontal {{ height: 5px; background: {c['Div']}; border-radius: 2px; }}
             QSlider::sub-page:horizontal {{ background: {c['MenuSel']}; border-radius: 2px; }}
-            QSlider::handle:horizontal {{ width: 10px; margin: -4px 0; background: {c['Txt']}; border-radius: 5px; }}
-            QCheckBox::indicator {{ width: 12px; height: 12px; border: 1px solid {c['Strk']}; border-radius: 3px; background: {c['Pnl']}; }}
-            QCheckBox::indicator:checked {{ background: {c['MenuSel']}; }}
-            QToolTip {{ background: {c['Pnl']}; color: {c['Txt']}; border: 1px solid {c['Strk']}; }}
+            QSlider::handle:horizontal {{ width: 12px; margin: -4px 0; background: {c['Txt']}; border-radius: 6px; }}
+            QSlider::handle:horizontal:hover {{ background: white; }}
+            QSlider::sub-page:horizontal:disabled {{ background: {c['Div']}; }}
+            QSlider::handle:horizontal:disabled {{ background: {faint}; }}
+            QCheckBox {{ spacing: 6px; }}
+            QCheckBox::indicator {{ width: 13px; height: 13px; border: 1px solid {c['Strk']}; border-radius: 3px; background: {bg[-1]}; }}
+            QCheckBox::indicator:hover {{ border-color: {QColor(c['Strk']).lighter(140).name()}; }}
+            QCheckBox::indicator:checked {{ background: {c['MenuSel']}; border-color: {QColor(c['MenuSel']).lighter(140).name()}; }}
+            QToolTip {{ background: {c['Pnl']}; color: {c['Txt']}; border: 1px solid {c['Strk']}; padding: 3px; }}
         ''')
         self.canvas.colors = self.colors
         self.canvas.update()
+
+    def set_connected(self, connected):
+        if self.dot.property('connected') == connected:
+            return
+        self.dot.setProperty('connected', connected)
+        self.dot.style().unpolish(self.dot)
+        self.dot.style().polish(self.dot)
+        self.state.setText('Connected' if connected else 'Not connected')
+
+    def show_filename(self):
+        name = self.media_path.name if self.media_path else ''
+        metrics = QFontMetrics(self.filename.font())
+        budget = max(90, self.width()-620)
+        self.filename.setMaximumWidth(budget)
+        self.filename.setText(metrics.elidedText(name, Qt.TextElideMode.ElideMiddle, budget))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'filename'):
+            self.show_filename()
+
+    def auto_update_changed(self, enabled):
+        self.save()
+        if enabled and not self.updater.installer:
+            self.updater.check()
+
+    def update_action(self):
+        updater = self.updater
+        if updater.installer:
+            if updater.install(relaunch=True):
+                self.installing = True
+                self.close()
+            return
+        if updater.release:
+            self.update_status.setText('Downloading…')
+            self.banner_text.setText(f'Downloading Eclipse Video {updater.release["version"]}…')
+            self.banner_action.setEnabled(False)
+            updater.download()
+            return
+        self.update_status.setText('Checking…')
+        self.update_button.setEnabled(False)
+        self.checked_by_hand = True
+        updater.check()
+
+    def update_found(self, release):
+        self.update_button.setEnabled(True)
+        self.update_status.setText(f'{release["version"]} available')
+        self.update_button.setText('DOWNLOAD UPDATE')
+        if self.auto_update.isChecked():
+            self.update_action()
+            return
+        self.banner_text.setText(f'Eclipse Video {release["version"]} is available')
+        self.banner_action.setText('DOWNLOAD')
+        self.banner_action.setEnabled(True)
+        self.banner.show()
+
+    def update_current(self):
+        self.update_button.setEnabled(True)
+        self.update_status.setText(f'Up to date · checked {time.strftime("%H:%M")}')
+        self.checked_by_hand = False
+
+    def update_progress(self, percent):
+        self.update_status.setText(f'Downloading {percent}%')
+
+    def update_ready(self, path):
+        version = self.updater.release['version']
+        self.update_status.setText(f'{version} ready · installs on restart')
+        self.update_button.setText('RESTART TO UPDATE')
+        self.update_button.setEnabled(True)
+        self.banner_text.setText(f'Eclipse Video {version} is ready')
+        self.banner_action.setText('RESTART NOW')
+        self.banner_action.setEnabled(True)
+        self.banner.show()
+
+    def update_failed(self, message):
+        self.update_button.setEnabled(True)
+        self.banner_action.setEnabled(True)
+        if self.updater.release:
+            self.update_status.setText('Download failed · try again')
+            self.update_button.setText('DOWNLOAD UPDATE')
+        elif self.checked_by_hand:
+            self.update_status.setText('Could not check · offline?')
+        self.checked_by_hand = False
 
     def pick_file(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Open video', str(self.media_path.parent if self.media_path else Path.home()/'Videos'), 'Videos (*.mp4 *.mov *.mkv *.webm *.avi *.wmv *.m4v);;All files (*)')
@@ -350,7 +570,7 @@ class Player(QMainWindow):
         # A repeated source does not emit LoadedMedia again on every backend.
         self.media.setSource(QUrl())
         self.media.setSource(QUrl.fromLocalFile(str(path)))
-        self.filename.setText(path.name+' -')
+        self.show_filename()
         self.filename.setToolTip(path.name)
         self.save()
 
@@ -408,7 +628,7 @@ class Player(QMainWindow):
             return
         fps = float(self.media.metaData().value(QMediaMetaData.Key.VideoFrameRate) or 30)
         frame = max(0, int(value*fps/1000 + .001))
-        self.timestamp.setText(f'{self.clock_text(value)} / {self.clock_text(self.media.duration())} | Frame {frame}')
+        self.timestamp.setText(f'{self.clock_text(value)} / {self.clock_text(self.media.duration())} · Frame {frame}')
 
     def begin_seek(self):
         self.media.pause()
@@ -524,11 +744,12 @@ class Player(QMainWindow):
 
     def toggle_settings(self):
         self.options.setVisible(not self.options.isVisible())
+        self.settings_button.setChecked(self.options.isVisible())
 
     def save(self):
         if not hasattr(self, 'volume'):
             return
-        data = {'alwaysOnTop': self.always_on_top, 'volume': self.volume.value(), 'restoreVolume': self.restore_volume, 'muted': self.mute.isChecked(), 'delay': self.offset.value(), 'speed': self.speed.value(), 'sync': self.sync.isChecked(), 'theme': self.colors}
+        data = {'alwaysOnTop': self.always_on_top, 'volume': self.volume.value(), 'restoreVolume': self.restore_volume, 'muted': self.mute.isChecked(), 'delay': self.offset.value(), 'speed': self.speed.value(), 'sync': self.sync.isChecked(), 'autoUpdate': self.auto_update.isChecked(), 'theme': self.colors}
         if self.media_path:
             data['file'] = str(self.media_path)
         temporary = self.settings_path.with_suffix('.tmp')
@@ -647,7 +868,7 @@ class Player(QMainWindow):
             self.control = None
             self.media.pause()
             self.save()
-        self.status.setText('ECLIPSE VIDEO - Connected' if self.owner else 'ECLIPSE VIDEO - Not Connected')
+        self.set_connected(bool(self.owner))
         self.filename.setToolTip(self.media_error or (str(self.media_path) if self.media_path else 'No video'))
         for control in [self.play, self.previous, self.next, self.seek]:
             control.setEnabled(self.prepared and (not linked or self.remote.get('controllable', True)))
@@ -714,6 +935,8 @@ class Player(QMainWindow):
         self.bridge.close()
         if self.diagnostics:
             self.diagnostics.write_text(json.dumps(self.metrics, indent=2))
+        if not self.installing and self.auto_update.isChecked():
+            self.updater.install(relaunch=False)
         event.accept()
 
 

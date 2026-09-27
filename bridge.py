@@ -24,9 +24,10 @@ class Request:
 class Bridge(QObject):
     received = Signal(object)
 
-    def __init__(self, parent=None, port=PORT):
+    def __init__(self, parent=None, port=PORT, version=''):
         super().__init__(parent)
         self.token = secrets.token_urlsafe(32)
+        self.version = version
         self.server = None
         bridge = self
 
@@ -54,7 +55,7 @@ class Bridge(QObject):
                     return self.reply(403, {'error': 'local app only'})
                 if self.path != '/hello':
                     return self.reply(404, {'error': 'unknown route'})
-                self.reply(200, {'app': 'Eclipse Video', 'protocol': 1, 'token': bridge.token, 'now': time.perf_counter()})
+                self.reply(200, {'app': 'Eclipse Video', 'version': bridge.version, 'protocol': 1, 'token': bridge.token, 'now': time.perf_counter()})
 
             def do_POST(self):
                 if not self.local() or not secrets.compare_digest(self.headers.get('X-Eclipse-Token', ''), bridge.token):
