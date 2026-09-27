@@ -6,7 +6,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QLockFile, QRectF
+from PySide6.QtCore import Qt, QTimer, QUrl, QLockFile, QRectF, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QVariantAnimation
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink, QMediaMetaData
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSizeGrip, QSlider, QToolButton, QVBoxLayout, QWidget
@@ -119,7 +119,7 @@ class Player(QMainWindow):
         except (OSError, ValueError):
             self.settings = {}
         self.setWindowTitle('Eclipse Video')
-        self.setWindowIcon(QIcon(str(ROOT/'assets/eclipse-app.png')))
+        self.setWindowIcon(QIcon(str(ROOT/'assets/eclipse-app.ico')))
         self.always_on_top = self.settings.get('alwaysOnTop') is True
         flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
         if self.always_on_top:
@@ -167,6 +167,9 @@ class Player(QMainWindow):
         self.media.mediaStatusChanged.connect(self.media_status)
         self.installing = False
         self.checked_by_hand = False
+        self.revealed = False
+        self.leaving = False
+        self.motion = {}
         self.updater = Updater(VERSION, UPDATES, self)
         self.updater.found.connect(self.update_found)
         self.updater.current.connect(self.update_current)
@@ -269,7 +272,7 @@ class Player(QMainWindow):
         banner.addStretch()
         self.banner_action = self.button('UPDATE', self.update_action, kind='Primary')
         banner.addWidget(self.banner_action)
-        banner.addWidget(self.button('LATER', lambda: self.banner.hide(), kind='Ghost'))
+        banner.addWidget(self.button('LATER', lambda: self.slide(self.banner, False), kind='Ghost'))
         layout.addWidget(self.banner)
         self.banner.hide()
         self.options = QFrame()
@@ -513,7 +516,7 @@ class Player(QMainWindow):
         self.banner_text.setText(f'Eclipse Video {release["version"]} is available')
         self.banner_action.setText('DOWNLOAD')
         self.banner_action.setEnabled(True)
-        self.banner.show()
+        self.slide(self.banner, True)
 
     def update_current(self):
         self.update_button.setEnabled(True)
@@ -531,7 +534,7 @@ class Player(QMainWindow):
         self.banner_text.setText(f'Eclipse Video {version} is ready')
         self.banner_action.setText('RESTART NOW')
         self.banner_action.setEnabled(True)
-        self.banner.show()
+        self.slide(self.banner, True)
 
     def update_failed(self, message):
         self.update_button.setEnabled(True)
@@ -743,8 +746,93 @@ class Player(QMainWindow):
         self.save()
 
     def toggle_settings(self):
-        self.options.setVisible(not self.options.isVisible())
-        self.settings_button.setChecked(self.options.isVisible())
+        show = not self.options.isVisible() or self.motion.get(self.options) == 'closing'
+        self.slide(self.options, show)
+        self.settings_button.setChecked(show)
+
+    def slide(self, widget, show):
+        if show and widget.isVisible() and self.motion.get(widget) != 'closing':
+            return
+        if not show and not widget.isVisible():
+            return
+        old = getattr(widget, 'motion', None)
+        if old:
+            old.stop()
+        start = widget.height() if widget.isVisible() else 0
+        if show:
+            widget.setFixedHeight(max(0, start))
+            widget.show()
+            end = widget.sizeHint().height()
+        else:
+            end = 0
+        self.motion[widget] = 'opening' if show else 'closing'
+        anim = QVariantAnimation(self)
+        anim.setDuration(280 if show else 170)
+        anim.setStartValue(float(start))
+        anim.setEndValue(float(end))
+        anim.setEasingCurve(QEasingCurve.Type.OutBack if show else QEasingCurve.Type.InCubic)
+        anim.valueChanged.connect(lambda value: widget.setFixedHeight(int(value)))
+
+        def settle():
+            self.motion.pop(widget, None)
+            widget.motion = None
+            if show:
+                widget.setMinimumHeight(0)
+                widget.setMaximumHeight(16777215)
+            else:
+                widget.hide()
+                widget.setMinimumHeight(0)
+                widget.setMaximumHeight(16777215)
+
+        anim.finished.connect(settle)
+        widget.motion = anim
+        anim.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.revealed:
+            return
+        self.revealed = True
+        final = self.geometry()
+        dx, dy = int(final.width()*.03), int(final.height()*.04)
+        self.setWindowOpacity(0)
+        self.setGeometry(final.adjusted(dx, dy, -dx, -dy))
+        group = QParallelAnimationGroup(self)
+        fade = QPropertyAnimation(self, b'windowOpacity', group)
+        fade.setDuration(220)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        grow = QPropertyAnimation(self, b'geometry', group)
+        grow.setDuration(300)
+        grow.setStartValue(final.adjusted(dx, dy, -dx, -dy))
+        grow.setEndValue(final)
+        grow.setEasingCurve(QEasingCurve.Type.OutBack)
+        group.addAnimation(fade)
+        group.addAnimation(grow)
+        group.start()
+        self.intro = group
+
+    def depart(self):
+        final = self.geometry()
+        dx, dy = int(final.width()*.03), int(final.height()*.04)
+        group = QParallelAnimationGroup(self)
+        fade = QPropertyAnimation(self, b'windowOpacity', group)
+        fade.setDuration(170)
+        fade.setStartValue(self.windowOpacity())
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.Type.InCubic)
+        group.addAnimation(fade)
+        if not self.isMaximized():
+            shrink = QPropertyAnimation(self, b'geometry', group)
+            shrink.setDuration(170)
+            shrink.setStartValue(final)
+            shrink.setEndValue(final.adjusted(dx, dy, -dx, -dy))
+            shrink.setEasingCurve(QEasingCurve.Type.InCubic)
+            group.addAnimation(shrink)
+        group.finished.connect(self.close)
+        group.start()
+        self.outro = group
 
     def save(self):
         if not hasattr(self, 'volume'):
@@ -927,6 +1015,11 @@ class Player(QMainWindow):
         self.last_target = target
 
     def closeEvent(self, event):
+        if not self.leaving:
+            self.leaving = True
+            event.ignore()
+            self.depart()
+            return
         self.timer.stop()
         self.media.stop()
         if self.arm_request:
