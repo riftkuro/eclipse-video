@@ -132,7 +132,7 @@ class Updater(QObject):
                 launcher = '' if getattr(sys, 'frozen', False) else f' "{Path(sys.argv[0]).resolve()}"'
                 command += f' & start "" "{sys.executable}"{launcher}'
             flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-            subprocess.Popen(['cmd', '/c', command], creationflags=flags, close_fds=True)
+            subprocess.Popen(f'cmd /d /s /c "{command}"', creationflags=flags, close_fds=True)
             return True
         app = bundle()
         if not app:
