@@ -15,7 +15,7 @@ from bridge import Bridge, PORT
 from sync import finite, palette, target_ms
 from updater import Updater
 
-VERSION = '1.7.0'
+VERSION = '1.7.1'
 
 ROOT = Path(__file__).resolve().parent
 MAC = sys.platform == 'darwin'
@@ -123,7 +123,32 @@ class Title(QWidget):
         w.showNormal() if w.isMaximized() else w.showMaximized()
 
 
+class Edge(QWidget):
+    CURSORS = {
+        Qt.Edge.LeftEdge: Qt.CursorShape.SizeHorCursor,
+        Qt.Edge.RightEdge: Qt.CursorShape.SizeHorCursor,
+        Qt.Edge.TopEdge: Qt.CursorShape.SizeVerCursor,
+        Qt.Edge.BottomEdge: Qt.CursorShape.SizeVerCursor,
+        Qt.Edge.TopEdge | Qt.Edge.LeftEdge: Qt.CursorShape.SizeFDiagCursor,
+        Qt.Edge.BottomEdge | Qt.Edge.RightEdge: Qt.CursorShape.SizeFDiagCursor,
+        Qt.Edge.TopEdge | Qt.Edge.RightEdge: Qt.CursorShape.SizeBDiagCursor,
+        Qt.Edge.BottomEdge | Qt.Edge.LeftEdge: Qt.CursorShape.SizeBDiagCursor,
+    }
+
+    def __init__(self, edges, parent):
+        super().__init__(parent)
+        self.edges = edges
+        self.setCursor(self.CURSORS[edges])
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.window().windowHandle():
+            self.window().windowHandle().startSystemResize(self.edges)
+
+
 class Player(QMainWindow):
+    BORDER = 6
+
     def __init__(self, port=PORT, settings_path=SETTINGS, diagnostics=None):
         super().__init__()
         for name in ('consola.ttf', 'consolab.ttf'):
@@ -197,6 +222,8 @@ class Player(QMainWindow):
         self.updater.ready.connect(self.update_ready)
         self.updater.failed.connect(self.update_failed)
         self.build()
+        self.edges = [Edge(edges, self) for edges in Edge.CURSORS]
+        self.place_edges()
         self.apply_theme(self.colors)
         self.set_connected(False)
         self.audio.setVolume(self.volume.value()/100)
@@ -502,6 +529,32 @@ class Player(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, 'filename'):
             self.show_filename()
+        self.place_edges()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        self.place_edges()
+
+    def place_edges(self):
+        if not hasattr(self, 'edges'):
+            return
+        w, h, b = self.width(), self.height(), self.BORDER
+        c = b*2
+        spots = {
+            Qt.Edge.LeftEdge: (0, c, b, h-c*2),
+            Qt.Edge.RightEdge: (w-b, c, b, h-c*2),
+            Qt.Edge.TopEdge: (c, 0, w-c*2, b),
+            Qt.Edge.BottomEdge: (c, h-b, w-c*2, b),
+            Qt.Edge.TopEdge | Qt.Edge.LeftEdge: (0, 0, c, c),
+            Qt.Edge.BottomEdge | Qt.Edge.RightEdge: (w-c, h-c, c, c),
+            Qt.Edge.TopEdge | Qt.Edge.RightEdge: (w-c, 0, c, c),
+            Qt.Edge.BottomEdge | Qt.Edge.LeftEdge: (0, h-c, c, c),
+        }
+        free = not (self.isMaximized() or self.isFullScreen())
+        for edge in self.edges:
+            edge.setGeometry(*spots[edge.edges])
+            edge.setVisible(free)
+            edge.raise_()
 
     def auto_update_changed(self, enabled):
         self.save()
@@ -1073,8 +1126,9 @@ class Player(QMainWindow):
             self.media.setPosition(round(target))
             self.last_correction = now
         elif now-self.last_correction>.2:
-            rate = self.speed.value()*(1+max(-.06,min(.06,self.last_drift/500)))
-            if abs(rate-self.media.playbackRate())>.002:
+            audible = self.media.hasAudio() and not self.audio.isMuted() and self.audio.volume() > 0
+            rate = self.speed.value() if audible else self.speed.value()*(1+max(-.06,min(.06,self.last_drift/500)))
+            if abs(rate-self.media.playbackRate())>(.0001 if audible else .002):
                 self.media.setPlaybackRate(rate)
         self.last_target = target
 
