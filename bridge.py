@@ -5,6 +5,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PySide6.QtCore import QObject, Signal
+from companion_access import AccessGate, AccessError
 
 PORT = 49185
 
@@ -29,6 +30,7 @@ class Bridge(QObject):
         self.token = secrets.token_urlsafe(32)
         self.version = version
         self.server = None
+        self.access = AccessGate()
         bridge = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -55,13 +57,15 @@ class Bridge(QObject):
                     return self.reply(403, {'error': 'local app only'})
                 if self.path != '/hello':
                     return self.reply(404, {'error': 'unknown route'})
-                self.reply(200, {'app': 'Eclipse Video', 'version': bridge.version, 'protocol': 1, 'token': bridge.token, 'now': time.perf_counter()})
+                self.reply(200, {'app': 'Eclipse Video', 'version': bridge.version, 'protocol': 1, 'authorization': 1, 'token': bridge.token, 'now': time.perf_counter()})
 
             def do_POST(self):
                 if not self.local() or not secrets.compare_digest(self.headers.get('X-Eclipse-Token', ''), bridge.token):
                     return self.reply(403, {'error': 'connection required'})
-                if self.path != '/command':
+                if self.path not in {'/authorize', '/command'}:
                     return self.reply(404, {'error': 'unknown route'})
+                if self.path != '/authorize' and not bridge.access.allowed(self.headers.get('X-Eclipse-Access', '')):
+                    return self.reply(403, {'error': 'Update and activate the official Eclipse plugin, then reconnect.'})
                 if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
                     return self.reply(415, {'error': 'json required'})
                 try:
@@ -74,6 +78,11 @@ class Bridge(QObject):
                         raise ValueError('object required')
                 except (ValueError, TimeoutError):
                     return self.reply(400, {'error': 'invalid request'})
+                if self.path == '/authorize':
+                    try:
+                        return self.reply(200, bridge.access.authorize(data))
+                    except AccessError as error:
+                        return self.reply(403, {'error': str(error)})
                 request = Request(data)
                 bridge.received.emit(request)
                 if request.done.wait(4):
@@ -87,6 +96,7 @@ class Bridge(QObject):
         threading.Thread(target=self.server.serve_forever, daemon=True, name='eclipse-video-local').start()
 
     def close(self):
+        self.access.clear()
         if self.server:
             server, self.server = self.server, None
             threading.Thread(target=lambda: (server.shutdown(), server.server_close()), daemon=True).start()
