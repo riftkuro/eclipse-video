@@ -6,7 +6,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QLockFile, QRectF, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QVariantAnimation
+from PySide6.QtCore import Qt, QTimer, QUrl, QLockFile, QPointF, QRectF, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QVariantAnimation
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink, QMediaMetaData
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSizeGrip, QSlider, QToolButton, QVBoxLayout, QWidget
@@ -15,7 +15,7 @@ from bridge import Bridge, PORT
 from sync import finite, palette, target_ms
 from updater import Updater
 
-VERSION = '1.7.3'
+VERSION = '1.7.4'
 
 ROOT = Path(__file__).resolve().parent
 MAC = sys.platform == 'darwin'
@@ -40,11 +40,96 @@ class Canvas(QWidget):
         super().__init__(parent)
         self.image = QImage()
         self.colors = palette({})
-        self.setMinimumSize(320, 180)
+        self.setMinimumSize(120, 68)
         self.setAcceptDrops(True)
         self.open_file = None
         self.hover = False
         self.error = ''
+        self.zoom = 1.0
+        self.pan = QPointF(0, 0)
+        self.dragging = None
+        self.badge_until = 0.0
+
+    def fit_rect(self):
+        if self.image.isNull():
+            return QRectF()
+        size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        w, h = size.width()*self.zoom, size.height()*self.zoom
+        center = QPointF(self.width()/2, self.height()/2)+self.pan
+        return QRectF(center.x()-w/2, center.y()-h/2, w, h)
+
+    def clamp_pan(self):
+        if self.image.isNull() or self.zoom <= 1:
+            self.pan = QPointF(0, 0)
+            return
+        size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        limit_x = max(0, (size.width()*self.zoom-self.width())/2)
+        limit_y = max(0, (size.height()*self.zoom-self.height())/2)
+        self.pan = QPointF(min(limit_x, max(-limit_x, self.pan.x())), min(limit_y, max(-limit_y, self.pan.y())))
+
+    def set_zoom(self, zoom, anchor=None):
+        zoom = min(8.0, max(1.0, zoom))
+        if self.image.isNull():
+            zoom = 1.0
+        if anchor is None:
+            anchor = QPointF(self.width()/2, self.height()/2)
+        center = QPointF(self.width()/2, self.height()/2)
+        ratio = zoom/self.zoom
+        self.pan = anchor-(anchor-center-self.pan)*ratio-center
+        self.zoom = zoom
+        self.clamp_pan()
+        self.badge_until = time.perf_counter()+1.2
+        self.setCursor(Qt.CursorShape.OpenHandCursor if self.zoom > 1 else Qt.CursorShape.ArrowCursor)
+        self.update()
+        QTimer.singleShot(1300, self.update)
+
+    def reset_zoom(self):
+        self.set_zoom(1.0)
+
+    def wheelEvent(self, event):
+        if self.image.isNull():
+            return super().wheelEvent(event)
+        steps = event.angleDelta().y()/120
+        if steps:
+            self.set_zoom(self.zoom*(1.2**steps), event.position())
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if self.zoom > 1 and event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
+            self.dragging = (event.position(), QPointF(self.pan))
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.dragging:
+            start, pan = self.dragging
+            self.pan = pan+(event.position()-start)
+            self.clamp_pan()
+            self.update()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.dragging:
+            self.dragging = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self.zoom > 1 else Qt.CursorShape.ArrowCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if self.zoom > 1:
+            self.reset_zoom()
+        elif not self.image.isNull():
+            self.set_zoom(2.0, event.position())
+        event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.clamp_pan()
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -77,9 +162,24 @@ class Canvas(QWidget):
                     p.drawEllipse(QRectF(self.width()-20-col*11-(row%2)*5, self.height()-20-row*10, r*2, r*2))
         else:
             p.fillRect(self.rect(), QColor(colors[-1]).darker(260))
-            size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
-            x, y = (self.width()-size.width())//2, (self.height()-size.height())//2
-            p.drawImage(x, y, self.image.scaled(size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            target = self.fit_rect()
+            visible = target.intersected(QRectF(self.rect()))
+            if not visible.isEmpty():
+                scale = self.image.width()/target.width()
+                source = QRectF((visible.x()-target.x())*scale, (visible.y()-target.y())*scale, visible.width()*scale, visible.height()*scale)
+                p.drawImage(visible, self.image, source)
+            if self.zoom > 1.001 or time.perf_counter() < self.badge_until:
+                text = f'{round(self.zoom*100)}%'
+                p.setFont(QFont('Roboto Mono', 9))
+                badge = QRectF(self.width()-10-(len(text)*8+14), 10, len(text)*8+14, 20)
+                p.setPen(Qt.PenStyle.NoPen)
+                back = QColor(colors[-1]).darker(180)
+                back.setAlpha(200)
+                p.setBrush(back)
+                p.drawRoundedRect(badge, 4, 4)
+                p.setPen(QColor(self.colors['Txt'][0]))
+                p.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
         if self.error:
             color = QColor('#ffa69b')
             p.setPen(color)
@@ -169,7 +269,8 @@ class Player(QMainWindow):
             flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.resize(820, 503)
-        self.setMinimumSize(760, 323)
+        self.setMinimumSize(340, self.BASE_HEIGHT)
+        self.compact_level = 0
         self.owner = None
         self.owner_active = False
         self.last_message = 0.0
@@ -239,6 +340,8 @@ class Player(QMainWindow):
         QShortcut(QKeySequence('M'), self, activated=lambda: self.mute.toggle())
         QShortcut(QKeySequence('Left'), self, activated=lambda: self.step(-1))
         QShortcut(QKeySequence('Right'), self, activated=lambda: self.step(1))
+        for keys, action in (('Ctrl+=', lambda: self.canvas.set_zoom(self.canvas.zoom*1.25)), ('Ctrl++', lambda: self.canvas.set_zoom(self.canvas.zoom*1.25)), ('Ctrl+-', lambda: self.canvas.set_zoom(self.canvas.zoom/1.25)), ('Ctrl+0', self.canvas.reset_zoom)):
+            QShortcut(QKeySequence(keys), self, activated=action)
         last = self.settings.get('file')
         if last and Path(last).is_file():
             QTimer.singleShot(0, lambda: self.open_video(last))
@@ -263,12 +366,14 @@ class Player(QMainWindow):
     def build(self):
         root = QFrame()
         root.setObjectName('Root')
+        root.setMinimumSize(320, 200)
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
         title = Title()
         row = QHBoxLayout(title)
+        self.title_row = row
         row.setContentsMargins(4, 0, 0, 0)
         row.setSpacing(6)
         self.dot = QLabel()
@@ -283,7 +388,6 @@ class Player(QMainWindow):
         self.state = QLabel('Not connected')
         self.state.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.state.setObjectName('Muted')
-        self.state.setMinimumWidth(QFontMetrics(self.state.font()).horizontalAdvance('Not connected')+4)
         row.addWidget(self.state)
         row.addStretch()
         self.filename = QLabel('')
@@ -329,9 +433,11 @@ class Player(QMainWindow):
         panel.setSpacing(6)
         options = QHBoxLayout()
         options.setSpacing(8)
-        options.addWidget(self.caption('PLAYBACK'))
+        self.playback_caption = self.caption('PLAYBACK')
+        options.addWidget(self.playback_caption)
         options.addSpacing(6)
-        options.addWidget(QLabel('Delay (ms)'))
+        self.delay_label = QLabel('Delay (ms)')
+        options.addWidget(self.delay_label)
         self.offset = QDoubleSpinBox()
         self.offset.setRange(-600000, 600000)
         self.offset.setDecimals(0)
@@ -340,7 +446,8 @@ class Player(QMainWindow):
         self.offset.setToolTip('Positive delays the video. Negative advances it.')
         options.addWidget(self.spin_field(self.offset, 62, 'Delay'))
         options.addSpacing(10)
-        options.addWidget(QLabel('Speed'))
+        self.speed_label = QLabel('Speed')
+        options.addWidget(self.speed_label)
         self.speed = QDoubleSpinBox()
         self.speed.setRange(.25, 4)
         self.speed.setSingleStep(.05)
@@ -349,7 +456,8 @@ class Player(QMainWindow):
         self.speed.valueChanged.connect(self.options_changed)
         options.addWidget(self.spin_field(self.speed, 52, 'Speed'))
         options.addStretch()
-        options.addWidget(self.button('RESET', lambda: (self.offset.setValue(0), self.speed.setValue(1)), kind='Ghost'))
+        self.reset_button = self.button('RESET', lambda: (self.offset.setValue(0), self.speed.setValue(1)), kind='Ghost')
+        options.addWidget(self.reset_button)
         panel.addLayout(options)
         divider = QFrame()
         divider.setObjectName('Divider')
@@ -357,11 +465,12 @@ class Player(QMainWindow):
         panel.addWidget(divider)
         updates = QHBoxLayout()
         updates.setSpacing(8)
-        updates.addWidget(self.caption('UPDATES'))
+        self.updates_caption = self.caption('UPDATES')
+        updates.addWidget(self.updates_caption)
         updates.addSpacing(6)
-        version = QLabel(f'Version {VERSION}')
-        version.setObjectName('Muted')
-        updates.addWidget(version)
+        self.version_label = QLabel(f'Version {VERSION}')
+        self.version_label.setObjectName('Muted')
+        updates.addWidget(self.version_label)
         updates.addSpacing(10)
         self.auto_update = QCheckBox('Auto-update')
         self.auto_update.setChecked(self.settings.get('autoUpdate', True) is not False)
@@ -389,6 +498,7 @@ class Player(QMainWindow):
         self.seek.sliderReleased.connect(self.finish_seek)
         layout.addWidget(self.seek)
         controls = QHBoxLayout()
+        self.controls_row = controls
         controls.setSpacing(6)
         self.previous = self.button('−1', lambda: self.step(-1), kind='Ghost')
         self.previous.setFixedWidth(38)
@@ -433,6 +543,47 @@ class Player(QMainWindow):
         grip.setFixedSize(12, 12)
         controls.addWidget(grip)
         layout.addLayout(controls)
+        for label in (self.status, self.state, self.filename, self.timestamp, self.sync):
+            label.setMinimumWidth(1)
+        self.zoom_tip = 'Scroll to zoom, drag to pan, double-click to reset  (Ctrl+0)'
+        self.canvas.setToolTip(self.zoom_tip)
+
+    COMPACT_STEPS = 9
+
+    def apply_compact(self, level):
+        self.compact_level = level
+        self.filename.setVisible(level < 1 and bool(self.filename.text()))
+        self.volume.setVisible(level < 2)
+        self.state.setVisible(level < 3)
+        self.sync.setText('Sync' if level >= 5 else 'Sync to Eclipse')
+        self.open_button.setText('OPEN' if level >= 6 else 'OPEN VIDEO')
+        self.settings_button.setText('SET' if level >= 6 else 'SETTINGS')
+        self.status.setVisible(level < 7)
+        self.timestamp.setVisible(level < 8)
+        self.version_label.setText(f'v{VERSION}' if level >= 3 else f'Version {VERSION}')
+        self.update_status.setVisible(level < 3)
+        self.delay_label.setText('Delay' if level >= 5 else 'Delay (ms)')
+        self.playback_caption.setVisible(level < 6)
+        self.speed_label.setVisible(level < 6)
+        self.reset_button.setVisible(level < 6)
+        self.updates_caption.setVisible(level < 6)
+        if self.update_button.text() in ('CHECK FOR UPDATES', 'CHECK'):
+            self.update_button.setText('CHECK' if level >= 4 else 'CHECK FOR UPDATES')
+        self.previous.setVisible(level < 9)
+        self.next.setVisible(level < 9)
+        self.dot.setToolTip(self.state.text())
+        self.update_timestamp(self.seek.value())
+        self.title_row.invalidate()
+        self.controls_row.invalidate()
+
+    def fit_layout(self):
+        if not hasattr(self, 'controls_row'):
+            return
+        room = self.centralWidget().width()-20
+        for level in range(self.COMPACT_STEPS+1):
+            self.apply_compact(level)
+            if max(self.title_row.sizeHint().width(), self.controls_row.sizeHint().width()) <= room:
+                break
 
     def spin_field(self, spin, width, name):
         field = QFrame()
@@ -517,6 +668,7 @@ class Player(QMainWindow):
         self.dot.style().unpolish(self.dot)
         self.dot.style().polish(self.dot)
         self.state.setText('Connected' if connected else 'Not connected')
+        self.dot.setToolTip(self.state.text())
 
     def show_filename(self):
         name = self.media_path.name if self.media_path else ''
@@ -524,6 +676,8 @@ class Player(QMainWindow):
         budget = max(90, self.width()-620)
         self.filename.setMaximumWidth(budget)
         self.filename.setText(metrics.elidedText(name, Qt.TextElideMode.ElideMiddle, budget))
+        self.filename.setToolTip(name)
+        self.fit_layout()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -642,6 +796,9 @@ class Player(QMainWindow):
             self.arm_request.finish({'error': 'video changed'})
             self.arm_request = None
         self.canvas.image = QImage()
+        self.canvas.zoom = 1.0
+        self.canvas.pan = QPointF(0, 0)
+        self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
         self.canvas.update()
         # A repeated source does not emit LoadedMedia again on every backend.
         self.media.setSource(QUrl())
@@ -714,7 +871,10 @@ class Player(QMainWindow):
             return
         fps = float(self.media.metaData().value(QMediaMetaData.Key.VideoFrameRate) or 30)
         frame = max(0, int(value*fps/1000 + .001))
-        self.timestamp.setText(f'{self.clock_text(value)} / {self.clock_text(self.media.duration())} · Frame {frame}')
+        if getattr(self, 'compact_level', 0) >= 4:
+            self.timestamp.setText(f'{self.clock_text(value)} · F{frame}')
+        else:
+            self.timestamp.setText(f'{self.clock_text(value)} / {self.clock_text(self.media.duration())} · Frame {frame}')
 
     def begin_seek(self):
         self.media.pause()
@@ -833,6 +993,19 @@ class Player(QMainWindow):
         self.slide(self.options, show)
         self.settings_button.setChecked(show)
 
+    BASE_HEIGHT = 220
+
+    def make_room(self, opening=None, height=0):
+        need = self.BASE_HEIGHT
+        for panel in (self.banner, self.options):
+            if panel is opening:
+                need += height+8
+            elif panel.isVisible() and self.motion.get(panel) != 'closing':
+                need += panel.sizeHint().height()+8
+        self.setMinimumHeight(need)
+        if self.height() < need and not (self.isMaximized() or self.isFullScreen()):
+            self.resize(self.width(), need)
+
     def slide(self, widget, show):
         if show and widget.isVisible() and self.motion.get(widget) != 'closing':
             return
@@ -846,6 +1019,7 @@ class Player(QMainWindow):
             widget.setFixedHeight(max(0, start))
             widget.show()
             end = widget.sizeHint().height()
+            self.make_room(widget, end)
         else:
             end = 0
         self.motion[widget] = 'opening' if show else 'closing'
@@ -866,6 +1040,7 @@ class Player(QMainWindow):
                 widget.hide()
                 widget.setMinimumHeight(0)
                 widget.setMaximumHeight(16777215)
+                self.make_room()
 
         anim.finished.connect(settle)
         widget.motion = anim
