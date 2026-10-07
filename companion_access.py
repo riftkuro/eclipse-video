@@ -20,24 +20,67 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise AccessError('Activation verification redirected unexpectedly.')
 
 
+REASONS = {
+    'not_activated': 'This activation was removed. Activate Eclipse again in Studio.',
+    'key_locked_to_other_user': 'Eclipse activation belongs to another Roblox account.',
+    'bad_request': 'The saved Eclipse activation is invalid. Activate Eclipse again in Studio.',
+    'invalid_token': 'The saved Eclipse activation expired or is invalid. Activate Eclipse again in Studio.',
+}
+
+
 def verify_receipt(token, user_id):
     body = json.dumps({'token': token, 'userId': user_id}).encode()
     request = urllib.request.Request(VERIFY_URL, data=body, headers={
-        'Content-Type': 'application/json', 'User-Agent': 'Eclipse-Companion-Access/1'})
-    try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=6) as response:
-            if response.status != 200:
-                raise AccessError('Eclipse activation could not be verified.')
-            payload = response.read(16385)
+        'Content-Type': 'application/json', 'Accept': 'application/json',
+        'User-Agent': 'Eclipse-Companion-Access/2'})
+    for attempt in range(2):
+        try:
+            try:
+                response = urllib.request.build_opener(NoRedirect()).open(request, timeout=12)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                status = response.code
+                payload = response.read(16385)
             if len(payload) > 16384:
-                raise AccessError('Invalid activation response.')
-            result = json.loads(payload)
-            if not isinstance(result, dict) or result.get('ok') is not True:
-                raise AccessError('Activate the official Eclipse plugin, then reconnect.')
-    except AccessError:
-        raise
-    except (OSError, ValueError, urllib.error.URLError):
-        raise AccessError('Could not verify Eclipse activation. Check your connection and retry.') from None
+                raise AccessError('Activation server returned an oversized response. Retry later.')
+            try:
+                result = json.loads(payload)
+            except (ValueError, UnicodeError):
+                result = None
+            if isinstance(result, dict) and result.get('ok') is True and status == 200:
+                return
+            reason = result.get('error') if isinstance(result, dict) else None
+            if isinstance(reason, str) and reason in REASONS:
+                raise AccessError(REASONS[reason])
+            if status == 429:
+                raise AccessError('Activation server is busy (HTTP 429). Wait a minute; Eclipse will retry.')
+            if status >= 500:
+                if attempt == 0:
+                    time.sleep(.5)
+                    continue
+                raise AccessError(f'Activation server is temporarily unavailable (HTTP {status}). Eclipse will retry.')
+            if status in (401, 403):
+                raise AccessError(f'Activation request was rejected (HTTP {status}). Reopen the official plugin and check its activation; if it works there, report this code.')
+            raise AccessError(f'Activation server returned an invalid response (HTTP {status}). Update the companion and retry.')
+        except AccessError:
+            raise
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            import ssl
+            import socket
+            reason = getattr(exc, 'reason', exc)
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                raise AccessError('Activation connection failed certificate verification. Check the Windows date and trusted certificates; HTTPS verification is required.') from None
+            if attempt == 0:
+                time.sleep(.5)
+                continue
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                detail = 'timed out'
+            elif isinstance(reason, socket.gaierror):
+                detail = 'could not resolve the activation server (DNS)'
+            else:
+                detail = 'could not reach the activation server'
+            raise AccessError(f'Eclipse Video {detail}. Check its firewall/proxy connection; Eclipse will retry.') from None
 
 
 class AccessGate:
