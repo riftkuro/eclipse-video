@@ -15,7 +15,7 @@ from bridge import Bridge, PORT
 from sync import finite, palette, target_ms
 from updater import Updater
 
-VERSION = '1.7.8'
+VERSION = '1.7.6'
 
 ROOT = Path(__file__).resolve().parent
 MAC = sys.platform == 'darwin'
