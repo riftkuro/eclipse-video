@@ -15,7 +15,7 @@ from bridge import Bridge, PORT
 from sync import finite, palette, target_ms
 from updater import Updater
 
-VERSION = '1.7.5'
+VERSION = '1.7.8'
 
 ROOT = Path(__file__).resolve().parent
 MAC = sys.platform == 'darwin'
@@ -352,6 +352,7 @@ class Player(QMainWindow):
         b = QPushButton(text, parent)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.setMinimumHeight(28)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         b.clicked.connect(callback)
         if kind:
             b.setObjectName(kind)
@@ -474,6 +475,7 @@ class Player(QMainWindow):
         updates.addSpacing(10)
         self.auto_update = QCheckBox('Auto-update')
         self.auto_update.setChecked(self.settings.get('autoUpdate', True) is not False)
+        self.auto_update.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.auto_update.setToolTip('Download new versions in the background and install them when you close the app')
         self.auto_update.toggled.connect(self.auto_update_changed)
         updates.addWidget(self.auto_update)
@@ -519,6 +521,7 @@ class Player(QMainWindow):
         controls.addStretch()
         self.sync = QCheckBox('Sync to Eclipse')
         self.sync.setChecked(True)
+        self.sync.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.sync.setToolTip('Follow the Eclipse timeline while the plugin is connected')
         self.sync.toggled.connect(self.sync_changed)
         self.mute = self.button('MUTE', lambda: None, kind='Ghost')
@@ -607,6 +610,30 @@ class Player(QMainWindow):
             row.addWidget(button)
         return field
 
+    def check_icon(self, color):
+        path = self.settings_path.parent/f'check-{QColor(color).name()[1:]}.png'
+        if not path.is_file():
+            image = QImage(26, 26, QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+            p = QPainter(image)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = QPen(QColor(color), 3.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            path_shape = QPainterPath()
+            path_shape.moveTo(6, 13.5)
+            path_shape.lineTo(11, 18.5)
+            path_shape.lineTo(20.5, 7.5)
+            p.drawPath(path_shape)
+            p.end()
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                image.save(str(path))
+            except OSError:
+                return ''
+        return path.as_posix()
+
     def apply_theme(self, raw):
         self.colors = palette(raw)
         c = {key: values[0] for key, values in self.colors.items()}
@@ -655,7 +682,7 @@ class Player(QMainWindow):
             QCheckBox {{ spacing: 6px; }}
             QCheckBox::indicator {{ width: 13px; height: 13px; border: 1px solid {c['Strk']}; border-radius: 3px; background: {bg[-1]}; }}
             QCheckBox::indicator:hover {{ border-color: {QColor(c['Strk']).lighter(140).name()}; }}
-            QCheckBox::indicator:checked {{ background: {c['MenuSel']}; border-color: {QColor(c['MenuSel']).lighter(140).name()}; }}
+            QCheckBox::indicator:checked {{ background: {c['MenuSel']}; border-color: {QColor(c['MenuSel']).lighter(140).name()}; image: url("{self.check_icon(c['Txt'])}"); }}
             QToolTip {{ background: {c['Pnl']}; color: {c['Txt']}; border: 1px solid {c['Strk']}; padding: 3px; }}
         ''')
         self.canvas.colors = self.colors
@@ -667,8 +694,15 @@ class Player(QMainWindow):
         self.dot.setProperty('connected', connected)
         self.dot.style().unpolish(self.dot)
         self.dot.style().polish(self.dot)
-        self.state.setText('Connected' if connected else 'Not connected')
-        self.dot.setToolTip(self.state.text())
+        self.show_access_state()
+
+    def show_access_state(self):
+        connected = bool(self.dot.property('connected'))
+        problem = '' if connected or not hasattr(self, 'bridge') else self.bridge.access.last_error
+        self.state.setText('Connected' if connected else 'Activation failed' if problem else 'Not connected')
+        self.state.setToolTip(problem)
+        self.state.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not problem)
+        self.dot.setToolTip(problem or self.state.text())
 
     def show_filename(self):
         name = self.media_path.name if self.media_path else ''
@@ -1236,9 +1270,13 @@ class Player(QMainWindow):
             self.media.pause()
             self.save()
         self.set_connected(bool(self.owner))
+        problem = '' if self.owner else self.bridge.access.last_error
+        if problem != self.state.toolTip():
+            self.show_access_state()
         self.filename.setToolTip(self.media_error or (str(self.media_path) if self.media_path else 'No video'))
-        if self.canvas.error != self.media_error:
-            self.canvas.error = self.media_error
+        problem = self.media_error or ('' if self.owner else self.bridge.access.last_error)
+        if self.canvas.error != problem:
+            self.canvas.error = problem
             self.canvas.update()
         for control in [self.play, self.previous, self.next, self.seek]:
             control.setEnabled(self.prepared and (not linked or self.remote.get('controllable', True)))

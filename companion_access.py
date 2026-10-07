@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import re
@@ -9,6 +10,13 @@ import urllib.request
 
 VERIFY_URL = 'https://eclipse-keys.riftex.workers.dev/verify'
 LIFETIME = 1800
+TICKET_KEY = bytes.fromhex('1b272f05e1e0fc6d43f8b86cf8f1e9c1a14a1fd7c7ef0304508e308735b5ba0b')
+TICKET_SKEW = 86400
+
+P = 2**255-19
+Q = 2**252+27742317777372353535851937790883648493
+D = -121665*pow(121666, P-2, P) % P
+ROOT = pow(2, (P-1)//4, P)
 
 
 class AccessError(ValueError):
@@ -83,6 +91,93 @@ def verify_receipt(token, user_id):
             raise AccessError(f'Eclipse Video {detail}. Check its firewall/proxy connection; Eclipse will retry.') from None
 
 
+def _point_add(a, b):
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    first = (y1-x1)*(y2-x2) % P
+    second = (y1+x1)*(y2+x2) % P
+    third = t1*2*D*t2 % P
+    fourth = z1*2*z2 % P
+    e, f, g, h = second-first, fourth-third, fourth+third, second+first
+    return (e*f % P, g*h % P, f*g % P, e*h % P)
+
+
+def _point_mul(scalar, point):
+    result = (0, 1, 1, 0)
+    while scalar:
+        if scalar & 1:
+            result = _point_add(result, point)
+        point = _point_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def _point_equal(a, b):
+    return (a[0]*b[2]-b[0]*a[2]) % P == 0 and (a[1]*b[2]-b[1]*a[2]) % P == 0
+
+
+def _decompress(data):
+    if len(data) != 32:
+        return None
+    y = int.from_bytes(data, 'little')
+    sign = y >> 255
+    y &= (1 << 255)-1
+    if y >= P:
+        return None
+    x2 = (y*y-1)*pow(D*y*y+1, P-2, P) % P
+    if x2 == 0:
+        return None if sign else (0, y, 1, 0)
+    x = pow(x2, (P+3)//8, P)
+    if (x*x-x2) % P:
+        x = x*ROOT % P
+    if (x*x-x2) % P:
+        return None
+    if x & 1 != sign:
+        x = P-x
+    return (x, y, 1, x*y % P)
+
+
+BASE = _decompress((4*pow(5, P-2, P) % P).to_bytes(32, 'little'))
+
+
+def ed25519_verify(public, message, signature):
+    if len(signature) != 64:
+        return False
+    a = _decompress(public)
+    r = _decompress(signature[:32])
+    s = int.from_bytes(signature[32:], 'little')
+    if a is None or r is None or s >= Q:
+        return False
+    h = int.from_bytes(hashlib.sha512(signature[:32]+public+message).digest(), 'little') % Q
+    return _point_equal(_point_mul(s, BASE), _point_add(r, _point_mul(h, a)))
+
+
+def _unpad(text):
+    return base64.urlsafe_b64decode(text+'='*(-len(text) % 4))
+
+
+def verify_ticket(ticket, user_id, now=None):
+    if not isinstance(ticket, str) or len(ticket) > 512:
+        raise AccessError('Companion ticket is invalid.')
+    parts = ticket.split('.')
+    if len(parts) != 3 or parts[0] != 'v1':
+        raise AccessError('Companion ticket is invalid.')
+    try:
+        payload = json.loads(_unpad(parts[1]))
+        signature = _unpad(parts[2])
+    except (ValueError, UnicodeError):
+        raise AccessError('Companion ticket is invalid.') from None
+    if not ed25519_verify(TICKET_KEY, (parts[0]+'.'+parts[1]).encode(), signature):
+        raise AccessError('Companion ticket signature is invalid.')
+    if not isinstance(payload, dict) or payload.get('v') != 1 or payload.get('u') != user_id:
+        raise AccessError('Companion ticket belongs to another Roblox account.')
+    expires = payload.get('e')
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        raise AccessError('Companion ticket is invalid.')
+    if (time.time() if now is None else now) > expires+TICKET_SKEW:
+        raise AccessError('Companion ticket expired.')
+
+
 class AccessGate:
     def __init__(self, verify=verify_receipt, clock=time.monotonic):
         self._verify = verify
@@ -90,16 +185,44 @@ class AccessGate:
         self._lock = threading.Lock()
         self._grants = {}
         self._attempts = []
+        self.last_error = ''
 
     def _prune(self, now):
         self._grants = {ticket: row for ticket, row in self._grants.items() if row[0] > now}
         self._attempts = [at for at in self._attempts if now - at < 60]
 
     def authorize(self, data):
-        receipt = data.get('receipt') if isinstance(data, dict) else None
+        try:
+            result = self._authorize(data)
+        except AccessError as error:
+            self.last_error = str(error)
+            raise
+        self.last_error = ''
+        return result
+
+    def _grant(self, fingerprint, now):
+        self._prune(now)
+        if len(self._grants) >= 16:
+            oldest = min(self._grants, key=lambda ticket: self._grants[ticket][0])
+            del self._grants[oldest]
+        ticket = secrets.token_urlsafe(32)
+        self._grants[ticket] = (now + LIFETIME, fingerprint)
+        return {'ticket': ticket, 'expiresIn': LIFETIME}
+
+    def _authorize(self, data):
         account = data.get('userId') if isinstance(data, dict) else None
+        signed = data.get('ticket') if isinstance(data, dict) else None
+        ticket_error = None
+        if isinstance(signed, str) and signed and not isinstance(account, bool) and isinstance(account, int) and 0 < account < 2**53:
+            try:
+                verify_ticket(signed, account)
+                with self._lock:
+                    return self._grant(hashlib.sha256(signed.encode()).digest(), self._clock())
+            except AccessError as error:
+                ticket_error = error
+        receipt = data.get('receipt') if isinstance(data, dict) else None
         if not isinstance(receipt, str) or len(receipt) > 1024:
-            raise AccessError('Update and activate the official Eclipse plugin, then reconnect.')
+            raise ticket_error or AccessError('Update and activate the official Eclipse plugin, then reconnect.')
         match = re.fullmatch(r'([0-9a-fA-F]{1,512}):([0-9]{1,16}):[0-9]{1,16}', receipt)
         if not match or isinstance(account, bool) or not isinstance(account, int) or not 0 < account < 2**53 or account != int(match[2]):
             raise AccessError('Eclipse activation does not match this Roblox account.')
@@ -114,13 +237,7 @@ class AccessGate:
                 raise AccessError('Too many activation checks. Wait a minute and reconnect.')
             self._attempts.append(now)
             self._verify(match[1], account)
-            now = self._clock()
-            self._prune(now)
-            if len(self._grants) >= 16:
-                raise AccessError('Too many active Eclipse connections.')
-            ticket = secrets.token_urlsafe(32)
-            self._grants[ticket] = (now + LIFETIME, fingerprint)
-            return {'ticket': ticket, 'expiresIn': LIFETIME}
+            return self._grant(fingerprint, self._clock())
 
     def allowed(self, ticket):
         if not isinstance(ticket, str) or len(ticket) > 128:
