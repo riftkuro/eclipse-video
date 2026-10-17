@@ -6,7 +6,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QLockFile, QPointF, QRectF, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QVariantAnimation
+from PySide6.QtCore import Qt, QAbstractAnimation, QTimer, QUrl, QLockFile, QPointF, QRectF, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QVariantAnimation
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink, QMediaMetaData
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSizeGrip, QSlider, QToolButton, QVBoxLayout, QWidget
@@ -757,10 +757,18 @@ class Player(QMainWindow):
 
     def update_action(self):
         updater = self.updater
+        if self.installing:
+            return
         if updater.installer:
+            self.banner_action.setEnabled(False)
+            self.update_button.setEnabled(False)
             if updater.install(relaunch=True):
                 self.installing = True
                 self.close()
+                return
+            self.banner_action.setEnabled(True)
+            self.update_button.setEnabled(True)
+            self.update_status.setText('Could not start the update')
             return
         if updater.release:
             self.update_status.setText('Downloading…')
@@ -1391,6 +1399,9 @@ class Player(QMainWindow):
             self.leaving = True
             event.ignore()
             self.depart()
+            return
+        if self.outro.state() == QAbstractAnimation.State.Running:
+            event.ignore()
             return
         self.timer.stop()
         self.media.stop()
