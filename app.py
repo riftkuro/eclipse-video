@@ -3,7 +3,6 @@ import json
 import os
 import sys
 import time
-from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl, QLockFile, QPointF, QRectF, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QVariantAnimation
@@ -11,11 +10,12 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QIm
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink, QMediaMetaData
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSizeGrip, QSlider, QToolButton, QVBoxLayout, QWidget
 
-from bridge import Bridge, PORT
-from sync import finite, palette, target_ms
+from bridge import Bridge, PORT, activate_existing
+from sync import finite, palette, target_ms, recovery_due
 from updater import Updater
+from audio_ready import AudioReady
 
-VERSION = '1.7.11'
+VERSION = '1.7.12'
 SESSION_TIMEOUT = 10.0
 
 ROOT = Path(__file__).resolve().parent
@@ -262,6 +262,9 @@ class Player(QMainWindow):
             self.settings = json.loads(self.settings_path.read_text())
         except (OSError, ValueError):
             self.settings = {}
+        if not isinstance(self.settings, dict):
+            self.settings = {}
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         self.setWindowTitle('Eclipse Video')
         self.setWindowIcon(QIcon(str(ROOT/('assets/eclipse-app.ico' if WINDOWS else 'assets/eclipse-app.png'))))
         self.always_on_top = self.settings.get('alwaysOnTop') is True
@@ -286,21 +289,15 @@ class Player(QMainWindow):
         self.arm_until = 0
         self.frame_ms = 0.0
         self.frame_received = 0.0
-        self.frames = deque(maxlen=12)
         self.startup_ms = finite(self.settings.get('startupMs'), 40, 0, 150)
         self.displayed_ms = 0.0
         self.last_correction = 0.0
         self.last_target = 0.0
         self.last_drift = 0.0
-        self.seek_latency = 150.0
-        self.seek_check = False
         self.drift_since = None
-        self.drift_smooth = 0.0
-        self.drift_at = 0.0
-        self.rate_at = 0.0
-        self.correcting = False
-        self.last_tick = 0.0
-        self.settle_until = 0.0
+        self.pending_seek = False
+        self.latest = None
+        self.present_queued = False
         self.media_path = None
         self.prepared = False
         self.media_error = ''
@@ -311,6 +308,7 @@ class Player(QMainWindow):
         self.first_frame_at = None
         self.colors = palette(self.settings.get('theme', {}))
         self.audio = QAudioOutput(self)
+        self.audio_ready = AudioReady(self.audio, self) if WINDOWS else None
         self.media = QMediaPlayer(self)
         self.media.setAudioOutput(self.audio)
         self.sink = QVideoSink(self)
@@ -341,6 +339,7 @@ class Player(QMainWindow):
         self.audio.setMuted(self.mute.isChecked())
         self.bridge = Bridge(self, port, VERSION)
         self.bridge.received.connect(self.command)
+        self.bridge.activated.connect(self.activate)
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(8)
@@ -813,6 +812,13 @@ class Player(QMainWindow):
             self.update_status.setText('Could not check · offline?')
         self.checked_by_hand = False
 
+    def activate(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def pick_file(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Open video', str(self.media_path.parent if self.media_path else Path.home()/('Movies' if MAC else 'Videos')), 'Videos (*.mp4 *.mov *.mkv *.webm *.avi *.wmv *.m4v);;All files (*)')
         if path:
@@ -827,16 +833,11 @@ class Player(QMainWindow):
         self.media_path = path
         self.prepared = False
         self.media_error = ''
-        self.frames.clear()
         self.frame_ms = self.displayed_ms = self.last_target = self.last_drift = 0.0
-        self.seek_latency = 150.0
-        self.seek_check = False
         self.drift_since = None
-        self.drift_smooth = 0.0
-        self.drift_at = 0.0
-        self.rate_at = 0.0
-        self.correcting = False
         self.frame_received = 0.0
+        self.pending_seek = False
+        self.latest = None
         self.last_correction = time.perf_counter()
         self.played_at = self.first_frame_at = self.scheduled_at = None
         if self.arm_request:
@@ -877,10 +878,16 @@ class Player(QMainWindow):
             self.first_frame_at = self.frame_received
             self.learn_startup((self.first_frame_at-self.played_at)*1000)
             self.metrics.append({'scheduled': self.scheduled_at, 'played': self.played_at, 'firstFrame': self.first_frame_at, 'frameMs': self.frame_ms})
-        if self.following() and self.remote.get('playing') and self.media.isPlaying():
-            self.frames.append((self.frame_ms, frame))
-            return
-        self.present(self.frame_ms, frame)
+        self.latest = (self.frame_ms, frame)
+        if not self.present_queued:
+            self.present_queued = True
+            QTimer.singleShot(0, self.present_latest)
+
+    def present_latest(self):
+        self.present_queued = False
+        if self.latest:
+            latest, self.latest = self.latest, None
+            self.present(*latest)
 
     def learn_startup(self, measured):
         # decoder wake-up time is stable per machine; keep a smoothed estimate to pre-roll the next start
@@ -1171,7 +1178,9 @@ class Player(QMainWindow):
             return request.finish({'error': 'invalid session'})
         # a plugin whose editor is open takes over from one that is only idling in another Studio window
         active = action in {'state', 'arm', 'start', 'stop'} and bool(data.get('controllable', True))
-        if self.owner and self.owner != session and now-self.last_message < SESSION_TIMEOUT and (self.owner_active or not active):
+        requesting_play = action in {'arm', 'start'} or (action == 'state' and bool(data.get('playing')))
+        owner_playing = bool(self.remote and (self.remote.get('playing') or self.remote.get('preparing')))
+        if self.owner and self.owner != session and now-self.last_message < SESSION_TIMEOUT and (self.owner_active or not active) and not (active and requesting_play and not owner_playing):
             return request.finish({'error': 'another Eclipse session is connected'})
         if self.owner != session:
             self.seq = -1
@@ -1179,14 +1188,19 @@ class Player(QMainWindow):
             self.control = None
             self.deadline = None
             self.media.pause()
+            if self.arm_request:
+                self.arm_request.finish({'error': 'session changed'})
+                self.arm_request = None
+            self.pending_seek = False
         self.owner = session
-        self.owner_active = active
-        self.last_message = now
         seq = int(finite(data.get('seq'), 0, 0, 2**53))
         # a sequence that jumps far backwards means the plugin restarted its counter
         if self.seq-10000 < seq <= self.seq:
             return request.finish(self.snapshot())
         self.seq = seq
+        if action != 'status':
+            self.owner_active = active
+        self.last_message = now
         if self.control and finite(data.get('ack'), -1, -1, 2**53) >= self.control['id']:
             self.control = None
         if 'theme' in data:
@@ -1207,6 +1221,16 @@ class Player(QMainWindow):
             if action in {'arm', 'stop'}:
                 state['playing'] = False
                 state['preparing'] = action == 'arm'
+            previous = self.remote
+            if action == 'state' and previous and state['playing'] and previous.get('playing'):
+                old = target_ms(previous, now, self.speed.value(), -self.offset.value())
+                new = target_ms(state, now, self.speed.value(), -self.offset.value())
+                delta = abs(new-old)
+                cycle = state['endTime']*1000*self.speed.value()
+                if state['loop'] and cycle > 0:
+                    delta = min(delta % cycle, cycle-delta % cycle)
+                if delta > max(200, 3000/state['fps']):
+                    self.pending_seek = True
             self.remote = state
             self.refresh_play_label()
             if action == 'state':
@@ -1216,11 +1240,11 @@ class Player(QMainWindow):
                     self.deadline = None
         if action == 'stop':
             self.deadline = None
-            self.frames.clear()
+            self.pending_seek = False
             self.media.pause()
         if action == 'arm' and self.sync.isChecked() and self.prepared:
             self.deadline = None
-            self.frames.clear()
+            self.pending_seek = False
             self.media.pause()
             target = min(self.media.duration(), max(0, target_ms(self.remote, now, self.speed.value(), -self.offset.value())))
             if abs(self.media.position()-target) > .5:
@@ -1233,6 +1257,7 @@ class Player(QMainWindow):
             self.finish_arm(now)
             return
         if action == 'start' and self.sync.isChecked() and self.prepared:
+            self.pending_seek = False
             if self.arm_request:
                 self.arm_request.finish({'error': 'superseded'})
                 self.arm_request = None
@@ -1240,7 +1265,6 @@ class Player(QMainWindow):
             self.remote['at'] = self.deadline
             self.remote['playing'] = True
             self.remote['preparing'] = False
-            self.frames.clear()
             self.media.pause()
             target = min(self.media.duration(), max(0, target_ms(self.remote, now, self.speed.value(), -self.offset.value())))
             if abs(self.media.position()-target) > .5:
@@ -1273,11 +1297,8 @@ class Player(QMainWindow):
 
     def step_clock(self):
         now = time.perf_counter()
-        if now-self.last_tick > .05:
-            self.settle_until = now+.25
-        self.last_tick = now
         linked = self.following()
-        interval = 1 if linked and (self.deadline is not None or self.remote.get('playing')) else 16
+        interval = 1 if linked and self.deadline is not None else 8 if linked and self.remote.get('playing') else 16
         if self.timer.interval() != interval:
             self.timer.setInterval(interval)
         self.finish_arm(now)
@@ -1289,8 +1310,8 @@ class Player(QMainWindow):
             self.media.pause()
             self.save()
         self.set_connected(bool(self.owner))
-        self.filename.setToolTip(self.media_error or (str(self.media_path) if self.media_path else 'No video'))
-        problem = self.media_error
+        self.filename.setToolTip(self.bridge.error or self.media_error or (str(self.media_path) if self.media_path else 'No video'))
+        problem = self.bridge.error or self.media_error
         if self.canvas.error != problem:
             self.canvas.error = problem
             self.canvas.update()
@@ -1301,10 +1322,9 @@ class Player(QMainWindow):
         self.refresh_play_label()
         if not linked or not self.prepared or self.arm_request or self.control or self.seek.isSliderDown():
             return
-        period = self.frame_period()
         if self.deadline is not None:
-            # wake the decoder early by its measured start-up time so the first frame lands on the deadline
-            if not self.media.isPlaying() and now >= self.deadline-self.startup_ms/1000:
+            pre_roll = 0 if self.media.hasAudio() else self.startup_ms/1000
+            if not self.media.isPlaying() and now >= self.deadline-pre_roll:
                 self.media.setPlaybackRate(self.speed.value())
                 self.media.play()
                 self.played_at = now
@@ -1321,69 +1341,32 @@ class Player(QMainWindow):
         state = self.remote
         target = target_ms(state, now, self.speed.value(), -self.offset.value())
         target = min(self.media.duration(), max(0, target))
-        chosen = None
-        while self.frames and self.frames[0][0] <= target+period*.5:
-            chosen = self.frames.popleft()
-        if chosen:
-            self.present(*chosen)
         if not state['playing'] or target <= 0 or target >= self.media.duration():
             self.media.pause()
             if abs(self.media.position()-target) > .5:
                 self.media.setPosition(round(target))
             self.last_target = target
+            self.pending_seek = False
+            self.drift_since = None
             return
-        if not self.media.isPlaying():
+        wrapped = state['loop'] and target < self.last_target-200
+        if self.pending_seek or wrapped:
             self.media.setPosition(round(target))
+            self.last_correction = now
+            self.pending_seek = False
+            self.drift_since = None
+        if not self.media.isPlaying():
+            if abs(self.media.position()-target) > 200:
+                self.media.setPosition(round(target))
             self.media.setPlaybackRate(self.speed.value())
             self.media.play()
             self.last_correction = now
-        # Seeking again before the decoder returns a frame can starve playback.
-        # Allow up to one second to decode after a start/seek, then recover using
-        # the media clock if that backend does not timestamp its frames.
-        fresh = self.frame_received >= self.last_correction and now-self.frame_received < .5
-        if not fresh and now-self.last_correction < 1.0:
-            self.last_target = target
-            return
-        actual = self.frame_ms + max(0, now-self.frame_received)*1000*self.media.playbackRate() if fresh else self.media.position()
-        # keep the decoder about a frame ahead so the frame for each tick is already buffered
-        lead = min(20, period)
-        self.last_drift = target+lead-actual
-        if self.seek_check and fresh:
-            self.seek_check = False
-            self.seek_latency = min(1500.0, max(0.0, self.seek_latency+self.last_drift*.8))
-        self.drift_smooth += (self.last_drift-self.drift_smooth)*min(1.0, max(0.0, now-self.drift_at)/.3)
-        self.drift_at = now
-        threshold = max(90, 2000/state['fps'])
-        wrapped = target < self.last_target-50
-        if now < self.settle_until and not wrapped:
-            self.drift_since = None
-            self.last_target = target
-            return
-        if self.last_drift > threshold or self.last_drift < -max(400, threshold*4):
-            self.drift_since = self.drift_since or now
-        else:
-            self.drift_since = None
-        held = self.drift_since is not None and now-self.drift_since > .25
-        if (wrapped or held or abs(self.last_drift) > 1000) and now-self.last_correction>.5:
-            self.frames.clear()
-            self.media.setPosition(round(min(self.media.duration(), target+self.seek_latency)))
+        self.last_drift = target-self.media.position()
+        recover, self.drift_since = recovery_due(self.last_drift, now, self.last_correction, self.drift_since)
+        if recover:
+            self.media.setPosition(round(target))
             self.last_correction = now
-            self.seek_check = True
             self.drift_since = None
-            self.drift_smooth = 0.0
-            self.correcting = False
-        elif now-self.last_correction>.2 and now-self.rate_at>.25:
-            audible = self.media.hasAudio() and not self.audio.isMuted() and self.audio.volume() > 0
-            limit, gain = (.04, 1500) if audible else (.06, 500)
-            if abs(self.drift_smooth) > 25:
-                self.correcting = True
-            elif abs(self.drift_smooth) < 6:
-                self.correcting = False
-            adjust = max(-limit, min(limit, self.drift_smooth/gain)) if self.correcting else 0.0
-            rate = self.speed.value()*(1+adjust)
-            if abs(rate-self.media.playbackRate()) > (.004 if audible else .002) or (adjust == 0 and rate != self.media.playbackRate()):
-                self.media.setPlaybackRate(rate)
-                self.rate_at = now
         self.last_target = target
 
     def closeEvent(self, event):
@@ -1394,6 +1377,8 @@ class Player(QMainWindow):
             return
         self.timer.stop()
         self.media.stop()
+        if self.audio_ready:
+            self.audio_ready.close()
         if self.arm_request:
             self.arm_request.finish({'error': 'player closed'})
         self.save()
@@ -1420,6 +1405,11 @@ def main():
     app.setApplicationName('Eclipse Video')
     lock = QLockFile(str(options.settings.parent/f'.player-{options.port}.lock'))
     if not lock.tryLock(0):
+        if not activate_existing(options.port):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(None, 'Eclipse Video already running',
+                f'Close the existing copy of Eclipse Video, then open version {VERSION} again. '
+                'The running copy could not be brought to the front.')
         return 0
     window = Player(options.port, options.settings, options.diagnostics)
     if options.video:

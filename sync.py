@@ -21,6 +21,13 @@ def target_ms(state, now, speed=1.0, offset=0):
     return position * 1000 * speed + offset
 
 
+def recovery_due(drift, now, last_seek, since):
+    if now - last_seek < 3 or abs(drift) <= 500:
+        return False, None
+    since = now if since is None else since
+    return now - since >= 1.5, since
+
+
 def palette(raw):
     default = {'Bg': ['#132b32', '#071a20'], 'Pnl': ['#10292f'], 'TopBtn': ['#1b3f47'],
                'MenuSel': ['#557d85'], 'Txt': ['#d6e7e7'], 'Strk': ['#385b64'], 'Div': ['#294851']}
