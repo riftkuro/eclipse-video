@@ -57,6 +57,7 @@ class Updater(QObject):
         self.folder = Path(folder)
         self.release = None
         self.installer = None
+        self.launched = False
         self.busy = False
         self.tidy()
 
@@ -124,6 +125,8 @@ class Updater(QObject):
         return lambda: self.ready.emit(target)
 
     def install(self, relaunch):
+        if self.launched:
+            return True
         if not self.installer or not self.installer.is_file():
             return False
         if WINDOWS:
@@ -133,6 +136,7 @@ class Updater(QObject):
                 command += f' & start "" "{sys.executable}"{launcher}'
             flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
             subprocess.Popen(f'cmd /d /s /c "{command}"', creationflags=flags, close_fds=True)
+            self.launched = True
             return True
         app = bundle()
         if not app:
@@ -156,4 +160,5 @@ rm -rf {shlex.quote(str(stage))} {shlex.quote(str(self.installer))}
 {'open -n ' + shlex.quote(str(app)) if relaunch else 'true'}
 '''
         subprocess.Popen(['/bin/sh', '-c', script], start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.launched = True
         return True
